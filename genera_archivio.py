@@ -1252,8 +1252,7 @@ main { min-height: 0; overflow: auto; }
 .prose table { border-collapse: collapse; width: 100%; background: var(--surface); }
 .prose th, .prose td { border: 1px solid var(--edge); text-align: left; padding: 7px 10px; }
 .table-scroll { margin: 1em 0; overflow: auto; }
-.file, .missing { display: inline-block; margin: 8px 9px 0 0; padding: 5px 9px; border-radius: 6px; border: 1px solid var(--edge); background: var(--surface); font-size: .86rem; overflow-wrap: anywhere; }
-.missing { color: var(--muted); }
+.file { display: inline-block; margin: 8px 9px 0 0; padding: 5px 9px; border-radius: 6px; border: 1px solid var(--edge); background: var(--surface); font-size: .86rem; overflow-wrap: anywhere; }
 .in-line-missing { color: var(--muted); }
 .message-image { display: block; max-width: 100%; max-height: 560px; width: auto; height: auto; margin-top: 9px; border-radius: 7px; object-fit: contain; }
 .mapped-image { margin: 9px 0 0; }
@@ -1391,8 +1390,8 @@ function inline(parent, text, view) {
         const file = Object.hasOwn(view.files, path) ? view.files[path] : null;
         if (file) {
           parent.append(marker && isImage(file) ? linkedImage(file, label) : fileLink(file, label, true));
-        } else {
-          parent.append(make("span", label + " (file non disponibile)", "in-line-missing"));
+        } else if (!marker) {
+          parent.append(label);
         }
       } else {
         parent.append(externalLink(href, label) || label);
@@ -1519,7 +1518,7 @@ function renderMarkdown(container, text, view, depth = 0) {
       inline(paragraph, lines[i], view);
       i += 1;
     }
-    container.append(paragraph);
+    if (paragraph.textContent.trim() || paragraph.querySelector("a, code")) container.append(paragraph);
   }
 }
 
@@ -1589,12 +1588,8 @@ function styledParts(parts) {
 
 function mappedAttachment(container, key, view) {
   const ref = view.refs.get(key);
-  if (!ref) return;
+  if (!ref || !Object.hasOwn(view.files, key)) return;
   view.shown.add(key);
-  if (!Object.hasOwn(view.files, key)) {
-    container.append(make("span", ref.name + " non disponibile", "missing"));
-    return;
-  }
   const file = view.files[key];
   if (ref.image && isImage(file)) {
     const figure = make("figure", undefined, "mapped-image");
@@ -1627,16 +1622,17 @@ function writingBlock(container, node, view) {
     if (remaining.length === 1) block = remaining[0];
   }
 
+  const hasInline = children.length > 0 && innerId !== block?.id;
+  const useSaved = block?.text && (!hasInline || !node.closed);
+  if (block && !useSaved && !hasInline && !Object.hasOwn(view.files, block.ref)) return;
   const element = make("div", undefined, "message-writing");
   const title = attributes.get("title") || attributes.get("subject") || block?.title || "Blocco di scrittura";
   element.append(make("p", title, "writing-title"));
-  const hasInline = children.length > 0 && innerId !== block?.id;
-  const useSaved = block?.text && (!hasInline || !node.closed);
   if (useSaved) {
     renderMarkdown(element, block.text, view);
   } else if (hasInline) {
     renderStyled(element, node.children, view);
-  } else if (!block || !Object.hasOwn(view.files, block.ref)) {
+  } else if (!block) {
     element.append(make("p", "Contenuto del blocco non disponibile.", "in-line-missing"));
   }
   if (block) {
@@ -1659,7 +1655,7 @@ function renderStyled(container, parts, view) {
     } else {
       const nested = make("div", undefined, "message-" + part.tag);
       renderStyled(nested, part.children, view);
-      container.append(nested);
+      if (nested.hasChildNodes()) container.append(nested);
     }
   }
 }
@@ -1782,12 +1778,12 @@ function renderChat(chat, fileData) {
   const refs = new Map(chat.refs.map((ref) => [ref.key, ref]));
   const content = document.createDocumentFragment();
   for (const message of chat.messages) {
-    const section = make("section", undefined, "message " + message.role);
-    const label = {user: "Utente", assistant: "ChatGPT", transcript: "Trascrizione"};
-    section.append(make("p", label[message.role], "role"));
     const prose = make("div", undefined, "prose");
     renderMessage(prose, message, files, refs);
-    section.append(prose);
+    if (!prose.hasChildNodes()) continue;
+    const section = make("section", undefined, "message " + message.role);
+    const label = {user: "Utente", assistant: "ChatGPT", transcript: "Trascrizione"};
+    section.append(make("p", label[message.role], "role"), prose);
     content.append(section);
   }
   if (!content.childNodes.length) content.append(make("p", "Nessun messaggio testuale."));

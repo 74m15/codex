@@ -38,7 +38,7 @@ Per collegare un allegato, il generatore cerca prima il suo ID ovunque nel nome 
 
 Le copie degli allegati usano il nome originale dei metadati quando è disponibile, oppure un nome ricavato dal file, ripulito dagli ID. L’estensione si basa sul contenuto, sul nome o sul tipo MIME. Il generatore usa `.bin` quando il formato resta sconosciuto. I file con lo stesso nome ricevono un suffisso numerico.
 
-Gli allegati del ramo visibile compaiono nel punto indicato dal `mapping`, oppure accanto al messaggio quando la posizione è indicata solo nei metadati. In fondo alla conversazione, **Allegati** raccoglie tutti i file trovati. Al suo interno, **Allegati non disponibili** elenca gli ID o i riferimenti rimasti senza file. Entrambe le sezioni sono chiuse all’apertura della conversazione.
+Gli allegati disponibili del ramo visibile compaiono nel punto indicato dal `mapping`, oppure accanto al messaggio quando la posizione è indicata solo nei metadati. In fondo alla conversazione, **Allegati** raccoglie tutti i file trovati. I riferimenti rimasti senza file compaiono solo nella sottosezione **Allegati non disponibili**. Entrambe le sezioni sono chiuse all’apertura della conversazione.
 
 Il clic apre un popup sopra la chat. Immagini, PDF, file di testo e i formati audio e video supportati dal browser hanno un’anteprima. Il pulsante **Scarica allegato** è disponibile per tutti i formati. Per applicare un aggiornamento, rigenera il sito dalla cartella dell’export originale.
 
