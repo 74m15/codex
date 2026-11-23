@@ -32,6 +32,10 @@ Aggiungi `--no-color` per un log senza sequenze ANSI. Entrambe le cartelle devon
 
 ## Contenuto dell’archivio
 
-La cronologia è ordinata per data e la ricerca copre i titoli e il testo del ramo attivo. Il generatore legge il cumulativo e integra i JSON individuali, deduplicando per ID. Usa i nomi prodotti dallo script v5 e i riferimenti nei messaggi per associare gli allegati. I file riconducibili solo alla conversazione compaiono in **File della conversazione**. Un allegato scaduto o con associazione ambigua può comparire come non disponibile.
+La cronologia è ordinata per data e la ricerca copre i titoli e il testo del ramo attivo. Il generatore legge il cumulativo e integra i JSON individuali, deduplicando per ID.
+
+Per collegare un allegato, il generatore cerca prima il suo ID nei nomi dei file, anche nelle sottocartelle. Se l’ID manca, prova i nomi normalizzati e le corrispondenze plausibili nella stessa conversazione. Gli abbinamenti ambigui restano da verificare. I file riconducibili solo alla conversazione compaiono in **File della conversazione**. Al termine il terminale mostra quanti riferimenti sono stati collegati.
+
+Il clic su un allegato apre un popup sopra la chat. Immagini, PDF, file di testo e i formati audio e video supportati dal browser hanno un’anteprima. Il pulsante **Scarica allegato** è disponibile per tutti i formati. Per applicare un aggiornamento, rigenera il sito dalla cartella dell’export originale.
 
 Il sito visualizza i costrutti Markdown più comuni, inclusi blocchi di codice, elenchi, citazioni e tabelle semplici. I blocchi Canvas esportati sono disponibili come file Markdown scaricabili.

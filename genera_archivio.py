@@ -5,18 +5,29 @@ import asyncio
 import codecs
 from collections import Counter, defaultdict
 from contextlib import aclosing
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+from html import escape
 import json
 from pathlib import Path
 import re
+from unicodedata import normalize
 from urllib.parse import unquote
 
 CHUNK_SIZE = 256 * 1024
 SEARCH_SHARD_SIZE = 256 * 1024
+PREVIEW_LIMIT = 64 * 1024
+TEXT_PREVIEW = {".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".log", ".yaml", ".yml", ".html", ".svg"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp"}
+FILE_SUFFIX = re.compile(r"\.[a-zA-Z0-9]{1,12}")
 SITE_FOLDER = "archivio-chat"
 BATCH_NAME = re.compile(r"chatgpt_business_export_COMPLETO_\d{4}-\d{2}-\d{2}\.json$")
 NUMBERED_NAME = re.compile(r"^(\d{4,})_(.+)$")
 UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
-FILE_ID = re.compile(r"file[_-][a-zA-Z0-9_-]+")
+FILE_ID = re.compile(r"(?<![a-z0-9])file[_-]([a-z0-9][a-z0-9_-]*)", re.ASCII | re.IGNORECASE)
+BARE_FILE_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{19,}")
+BROWSER_COPY = re.compile(r" \(\d+\)(?=(?:\.[^./ ]+)?$)")
+GENERATED_FOLDER = re.compile(r"archivio-chat(?:-\d+)?$")
 SANDBOX_LINK = re.compile(r"""sandbox:(/mnt/data/[^\s)"\]'<>]+)""")
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
@@ -79,6 +90,9 @@ class LocalFolder:
         path.mkdir()
         return LocalFolder(path)
 
+    async def subfolder(self, name):
+        return LocalFolder(self.path / name)
+
 
 class BrowserFolder:
     """Accede agli handle del browser con al massimo un blocco per lettura."""
@@ -130,6 +144,9 @@ class BrowserFolder:
         create = Object.new()
         create.create = True
         return BrowserFolder(await self.handle.getDirectoryHandle(name, create))
+
+    async def subfolder(self, name):
+        return BrowserFolder(await self.handle.getDirectoryHandle(name))
 
 
 async def write_text(folder, name, content):
@@ -251,11 +268,37 @@ def sandbox_path(url):
     return ""
 
 
-def file_id(value):
-    if not isinstance(value, str) or "user-" in value:
-        return ""
-    match = FILE_ID.search(value)
-    return match[0] if match else ""
+def file_id(value, allow_bare=False):
+    value = unquote(string(value)).strip().split("?", 1)[0].split("#", 1)[0]
+    _, _, target = value.rpartition("://")
+    for part in reversed(target.strip("/").split("/")):
+        if match := FILE_ID.fullmatch(part):
+            return match[0]
+        if allow_bare and not part.startswith("user-") and BARE_FILE_ID.fullmatch(part):
+            return f"file_{part}"
+    return ""
+
+
+def file_key(identifier):
+    return "file_" + identifier[5:]
+
+
+def add_file_ref(refs, data, identifier, image=False):
+    title = next(
+        (data[field] for field in ("name", "filename", "file_name", "fileName") if string(data.get(field))),
+        "",
+    )
+    if not identifier and not title:
+        return
+    key = file_key(identifier) if identifier else f"nome:{title}"
+    previous = refs.get(key, {})
+    title = title or (previous["name"] if previous and not previous.get("generic") else "")
+    mime = string(data.get("mime_type") or data.get("mimeType"))
+    image = image or previous.get("image", False) or mime.startswith("image/")
+    refs[key] = {
+        "key": key, "id": identifier, "name": title or ("Immagine" if image else "Allegato"),
+        "image": image, "generic": not title,
+    }
 
 
 def path_nodes(raw):
@@ -313,11 +356,10 @@ def prepare_messages(raw, fallback):
             text = string(part.get("text"))
             if text:
                 text_parts.append(text)
-            asset = file_id(part.get("asset_pointer"))
-            if asset:
-                image = part.get("content_type") == "image_asset_pointer"
-                label = "Immagine" if image else "Allegato"
-                refs[asset] = {"key": asset, "name": label, "image": image, "generic": True}
+            pointer = part.get("asset_pointer") or part.get("file_id")
+            if pointer:
+                asset = file_id(pointer, allow_bare=not part.get("asset_pointer"))
+                add_file_ref(refs, part, asset, part.get("content_type") == "image_asset_pointer")
 
         body = "\n".join(text_parts) or string(content.get("text"))
         if body and content.get("content_type") in ("code", "execution_output"):
@@ -326,14 +368,14 @@ def prepare_messages(raw, fallback):
 
         for attachment in array(metadata.get("attachments")):
             attachment = obj(attachment)
-            asset = file_id(attachment.get("id"))
-            if asset:
-                title = string(attachment.get("name") or attachment.get("file_name"))
-                image = refs.get(asset, {}).get("image") or string(attachment.get("mime_type")).startswith("image/")
-                refs[asset] = {
-                    "key": asset, "name": title or ("Immagine" if image else "Allegato"),
-                    "image": bool(image), "generic": not title,
-                }
+            asset = next(
+                (
+                    identifier for field in ("id", "file_id", "asset_pointer")
+                    if (identifier := file_id(attachment.get(field), allow_bare=field != "asset_pointer"))
+                ),
+                "",
+            )
+            add_file_ref(refs, attachment, asset)
 
         for match in SANDBOX_LINK.finditer(body):
             path = unquote(match[1])
@@ -359,31 +401,33 @@ def prepare_messages(raw, fallback):
 def scan_names(entries):
     batches = []
     individual_candidates = defaultdict(list)
-    numbered = defaultdict(list)
     for name, kind in sorted(entries.items()):
         if kind != "file":
             continue
-        if BATCH_NAME.fullmatch(name):
+        original = without_copy(name)
+        if BATCH_NAME.fullmatch(original):
             batches.append(name)
             continue
-        match = NUMBERED_NAME.fullmatch(name)
+        match = NUMBERED_NAME.fullmatch(original)
         if not match:
             continue
-        number, rest = match.groups()
-        numbered[number].append(name)
+        rest = match[2]
         if rest.endswith(".json") and "_" in rest:
             _, _, identifier = rest[:-5].rpartition("_")
             if identifier and not identifier.isdecimal():
                 individual_candidates[identifier].append(name)
-    return batches[::-1], individual_candidates, numbered
+    return sorted(batches, key=without_copy, reverse=True), individual_candidates
 
 
-def individual_stem(identifier, title, candidates):
-    for name in candidates.get(identifier, ()):
-        suffix = f"_{identifier}.json"
+def individual_file(identifier, title, candidates):
+    names = candidates.get(identifier, ())
+    suffix = f"_{identifier}.json"
+    for name in names:
         number = name.split("_", 1)[0]
-        if name == f"{number}_{sanitize(title)}{suffix}":
-            return name.removesuffix(suffix)
+        if without_copy(name) == f"{number}_{sanitize(title)}{suffix}":
+            return name
+    if len({without_copy(name) for name in names}) == 1:
+        return names[0]
     return None
 
 
@@ -412,60 +456,319 @@ def group_unknown(numbered, rows, known_stems):
     return {title: next(iter(stems)) for title, stems in possibilities.items() if len(stems) == 1}
 
 
-def match_attachment(ref, files):
-    key = ref["key"]
-    if key.startswith("/mnt/data/"):
-        expected = [sanitize(key.rsplit("/", 1)[-1])]
-    elif key.startswith("Canvas_"):
-        expected = [key]
-    else:
-        expected = [] if ref.get("generic") else [sanitize(ref["name"])]
-        expected.extend(name for name in files if name == key or name.startswith(f"{key}."))
-    matches = {name for name in expected if name in files}
-    if len(matches) == 1:
-        return matches.pop()
-    return None
+@dataclass(frozen=True)
+class Attachment:
+    folder: object
+    parents: tuple
+    name: str
 
 
-async def attach_files(source, target, row, names, stem, excluded, terminal):
-    prefix = stem + "_"
-    files = {}
-    for name in names:
-        if name not in excluded and name.startswith(prefix):
-            suffix = name[len(prefix):]
-            if not suffix:
+async def collect_attachments(source, entries, excluded, terminal):
+    folders = [(source, (), entries)]
+    while folders:
+        folder, parents, contents = folders.pop()
+        for name, kind in sorted(contents.items()):
+            if kind == "file":
+                if (parents or name not in excluded) and not BATCH_NAME.fullmatch(without_copy(name)):
+                    yield Attachment(folder, parents, name)
+            elif kind == "directory" and not GENERATED_FOLDER.fullmatch(name):
+                try:
+                    child = await folder.subfolder(name)
+                    folders.append((child, (*parents, name), await child.entries()))
+                except Exception as exc:
+                    terminal.warning(f"Cartella allegati saltata: {'/'.join((*parents, name))} ({exc})")
+                await asyncio.sleep(0)
+
+
+def without_copy(name):
+    return BROWSER_COPY.sub("", name)
+
+
+def name_forms(name):
+    base = without_copy(name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1])
+    result = set()
+    for variant in (base, sanitize(base), sanitize(name)):
+        stem, ext = Path(variant).stem, Path(variant).suffix
+        flat = "".join(char for char in normalize("NFKD", stem.casefold()) if char.isalnum())
+        result.add((flat, ext.casefold()))
+    return result
+
+
+def name_score(ref, name, fuzzy=False):
+    if ref.get("generic"):
+        return 0
+    expected = ref["name"]
+    if name == expected:
+        return 300
+    if without_copy(name) == without_copy(expected):
+        return 290
+    if name_forms(name) & name_forms(expected):
+        return 260
+    if not fuzzy:
+        return 0
+
+    best = 0
+    for expected_stem, expected_ext in name_forms(expected):
+        for actual_stem, actual_ext in name_forms(name):
+            if (expected_ext != actual_ext or min(len(expected_stem), len(actual_stem)) < 6
+                    or max(len(expected_stem), len(actual_stem)) > 256):
                 continue
-            files[suffix] = name
-    if not files:
+            if re.findall(r"\d+", expected_stem) != re.findall(r"\d+", actual_stem):
+                continue
+            similarity = SequenceMatcher(None, expected_stem, actual_stem, autojunk=False).ratio()
+            if similarity >= 0.84:
+                best = max(best, round(similarity * 100))
+    return best
+
+
+FILE_MARKER = re.compile(r"(?<![a-z0-9])file[_-]", re.ASCII | re.IGNORECASE)
+ID_PAYLOAD = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]*")
+BARE_IN_NAME = re.compile(r"(?<![a-zA-Z0-9])(?:" + UUID.pattern.removesuffix("$")
+                          + r"|[a-zA-Z0-9]{20,})(?![a-zA-Z0-9])")
+
+
+def ids_in_name(name, known_ids, partial_ids):
+    name = unquote(without_copy(name))
+    marked = False
+    for marker in FILE_MARKER.finditer(name):
+        token = ID_PAYLOAD.match(name, marker.end())
+        if not token:
+            continue
+        marked = True
+        payload = token[0]
+        ends = [index for index, char in enumerate(payload) if char in "_-"]
+        for end in reversed([*ends, len(payload)]):
+            key = f"file_{payload[:end]}"
+            if key in known_ids:
+                yield key, 4, name[marker.start():token.start() + end]
+                break
+        else:
+            if token.end() == len(name) and len(payload) >= 20:
+                matches = partial_ids.get(payload[:20], ())
+                matches = [key for key in matches if key[5:].startswith(payload)]
+                if len(matches) == 1:
+                    yield matches[0], 1, ""
+    if not marked:
+        for match in BARE_IN_NAME.finditer(name):
+            key = f"file_{match[0]}"
+            if key in known_ids:
+                yield key, 2, ""
+
+
+class AttachmentIndex:
+    def __init__(self, rows, inferred):
+        self.known_ids = {ref["key"] for row in rows for ref in row["refs"].values() if ref.get("id")}
+        self.partial_ids = defaultdict(list)
+        for key in self.known_ids:
+            if len(key[5:]) >= 20:
+                self.partial_ids[key[5:25]].append(key)
+        self.numbered = defaultdict(list)
+        self.by_parent = defaultdict(list)
+        self.by_id = defaultdict(dict)
+        self.loose = defaultdict(list)
+        self.marked = set()
+        self.prefixes = defaultdict(set)
+        for row in rows:
+            stem = row["stem"] or inferred.get(row["safeTitle"])
+            if stem:
+                self.prefixes[stem.split("_", 1)[0]].add(stem.casefold() + "_")
+        self.chat_folders = {
+            value.casefold() for row in rows
+            for value in (row["id"], row["stem"] or inferred.get(row["safeTitle"])) if value
+        }
+
+    def add(self, asset):
+        numbered = NUMBERED_NAME.fullmatch(asset.name)
+        filename = asset.name
+        if numbered:
+            self.numbered[numbered[1]].append(asset)
+            prefix_length = max(
+                (len(prefix) for prefix in self.prefixes[numbered[1]]
+                 if filename.casefold().startswith(prefix)),
+                default=0,
+            )
+            filename = filename[prefix_length:]
+        parents = {parent.casefold() for parent in asset.parents}
+        for parent in parents:
+            self.by_parent[parent].append(asset)
+        if not numbered and not parents.intersection(self.chat_folders) and not any(
+            NUMBERED_NAME.fullmatch(parent) for parent in parents
+        ):
+            for form in name_forms(asset.name):
+                self.loose[form].append(asset)
+        if any(len(match[1]) >= 20 for match in FILE_ID.finditer(unquote(filename))):
+            self.marked.add(asset)
+        for key, strength, spelling in ids_in_name(filename, self.known_ids, self.partial_ids):
+            self.marked.add(asset)
+            self.by_id[key].setdefault(asset, set()).add((strength, spelling))
+
+    def nearby(self, row, stem):
+        files = {}
+        if stem:
+            prefix = stem.casefold() + "_"
+            number = stem.split("_", 1)[0]
+            for asset in self.numbered[number]:
+                if asset.name.casefold().startswith(prefix) and len(asset.name) > len(prefix):
+                    files[asset] = asset.name[len(prefix):]
+            for asset in self.by_parent[stem.casefold()]:
+                files.setdefault(asset, asset.name)
+        for asset in self.by_parent[row["id"].casefold()]:
+            files.setdefault(asset, asset.name)
+        return files
+
+    def match(self, ref, nearby):
+        if ref.get("id"):
+            candidates = self.by_id.get(ref["key"], {})
+            if candidates:
+                def rank(asset):
+                    strength = max((level, spelling == ref["id"]) for level, spelling in candidates[asset])
+                    display = nearby.get(asset, asset.name)
+                    names = [display]
+                    for _, spelling in candidates[asset]:
+                        if spelling:
+                            suffix = unquote(display).partition(spelling)[2].lstrip("_- ")
+                            if suffix and not suffix.startswith("."):
+                                names.append(suffix)
+                    similarity = max(name_score(ref, name, fuzzy=True) for name in names)
+                    return (strength, asset in nearby, similarity,
+                            without_copy(asset.name) == asset.name, -len(asset.parents))
+
+                return max(candidates, key=rank)
+        if ref.get("generic"):
+            return None
+        ranked = sorted(
+            ((name_score(ref, name, fuzzy=True), asset) for asset, name in nearby.items()
+             if asset not in self.marked),
+            key=lambda item: item[0], reverse=True,
+        )
+        if ranked and ranked[0][0]:
+            best, asset = ranked[0]
+            other = next((score for score, candidate in ranked[1:]
+                          if candidate.folder is not asset.folder
+                          or without_copy(candidate.name) != without_copy(asset.name)), 0)
+            if best > other and (best >= 260 or best - other >= 8):
+                return asset
+            return None
+        matches = {
+            candidate
+            for form in name_forms(ref["name"])
+            for candidate in self.loose.get(form, ())
+            if candidate not in self.marked
+        }
+        if len(matches) == 1:
+            return matches.pop()
         return None
+
+
+async def copy_attachment(folder, name, asset, inspect_bytes):
+    sample = bytearray()
+    size = 0
+
+    async def chunks():
+        nonlocal size
+        async for chunk in asset.folder.read(asset.name):
+            size += len(chunk)
+            sample.extend(chunk[:max(0, inspect_bytes - len(sample))])
+            yield chunk
+
+    await folder.write(name, chunks())
+    return sample, size
+
+
+async def text_preview(folder, name, sample, size):
+    text = sample.decode("utf-8-sig", errors="replace")
+    notice = f"<p>Anteprima dei primi {PREVIEW_LIMIT // 1024} KiB.</p>" if size > len(sample) else ""
+    await write_text(folder, name, (
+        '<!doctype html><html lang="it"><meta charset="utf-8">'
+        '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'">'
+        '<title>Anteprima allegato</title><style>:root{color-scheme:light dark}'
+        'pre{white-space:pre-wrap;overflow-wrap:anywhere}</style>'
+        f'{notice}<pre>{escape(text)}</pre></html>'
+    ))
+
+
+async def attach_files(target, previews, row, index, stem, terminal):
+    nearby = index.nearby(row, stem)
+    matches = {}
+    for ref in row["refs"].values():
+        if asset := index.match(ref, nearby):
+            matches[ref["key"]] = asset
+
+    # Più ID con lo stesso nome e una sola copia senza ID sono un caso ambiguo.
+    claims = defaultdict(set)
+    for key, asset in matches.items():
+        if row["refs"][key].get("id"):
+            claims[asset].add(key)
+    matches = {key: asset for key, asset in matches.items() if len(claims[asset]) < 2}
+
+    unmatched_images = [
+        ref for ref in row["refs"].values() if ref.get("image") and ref.get("generic")
+        and ref["key"] not in matches
+    ]
+    if len(unmatched_images) == 1:
+        assigned = set(matches.values())
+        images = [
+            asset for asset, display in nearby.items()
+            if asset not in assigned and asset not in index.marked
+            and Path(without_copy(display)).suffix.casefold() in IMAGE_SUFFIXES
+        ]
+        if len(images) == 1:
+            matches[unmatched_images[0]["key"]] = images[0]
+
+    expected_names = {
+        asset: row["refs"][key]["name"] for key, asset in matches.items()
+        if not row["refs"][key].get("generic")
+    }
+    files = dict(nearby)
+    files.update({asset: nearby.get(asset, asset.name) for asset in matches.values()})
+    if not files:
+        return {"links": {}, "all": []}
 
     folder = await target.mkdir(row["key"])
     available = {}
     used_names = set()
-    for index, (display, original) in enumerate(files.items(), 1):
-        name = sanitize(display).rstrip(".") or "file"
+    for position, (asset, display) in enumerate(files.items(), 1):
+        original = Path(without_copy(display))
+        suffix = original.suffix
+        filename_stem = original.stem
+        if not FILE_SUFFIX.fullmatch(suffix) and asset in expected_names:
+            suffix = Path(without_copy(expected_names[asset])).suffix
+            filename_stem = original.name
+        if FILE_SUFFIX.fullmatch(suffix):
+            filename_stem = sanitize(filename_stem)[:60 - len(suffix)].rstrip(".") or "file"
+            name = filename_stem + suffix
+        else:
+            name = sanitize(original.name).rstrip(".") or "file"
         if re.fullmatch(r"CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]", name.split(".")[0], re.IGNORECASE):
             name = f"_{name}"
         while name.casefold() in used_names:
-            name = f"{index}-{name}"
+            name = f"{position}-{name}"
         used_names.add(name.casefold())
+        extension = Path(name).suffix.casefold()
+        inspect_bytes = PREVIEW_LIMIT if extension in TEXT_PREVIEW else 1024 if extension == ".pdf" else 0
         try:
-            await folder.write(name, source.read(original))
+            sample, size = await copy_attachment(folder, name, asset, inspect_bytes)
         except Exception as exc:
-            terminal.warning(f"File saltato: {original} ({exc})")
+            terminal.warning(f"File saltato: {'/'.join((*asset.parents, asset.name))} ({exc})")
         else:
-            available[display] = {
+            file = {
                 "name": display,
                 "url": f"file/{row['key']}/{name}",
             }
+            if extension in TEXT_PREVIEW and b"\0" not in sample:
+                preview = f"{row['key']}-anteprima-{position}.html"
+                try:
+                    await text_preview(previews, preview, sample, size)
+                except Exception as exc:
+                    terminal.warning(f"Anteprima saltata: {display} ({exc})")
+                else:
+                    file["preview"] = f"chat/{preview}"
+            elif extension == ".pdf" and sample.startswith(b"%PDF-"):
+                file["pdf"] = True
+            available[asset] = file
 
-    linked = {}
-    for ref in row["refs"].values():
-        match = match_attachment(ref, available)
-        if match:
-            linked[ref["key"]] = available[match]
+    linked = {key: available[asset] for key, asset in matches.items() if asset in available}
     return {"links": linked, "all": list(available.values())}
-
 
 async def create_site_folder(destination):
     contents = await destination.entries()
@@ -482,7 +785,7 @@ async def create_site_folder(destination):
 
 async def generate(source, destination, terminal):
     entries = await source.entries()
-    batches, candidates, numbered = scan_names(entries)
+    batches, candidates = scan_names(entries)
     if not batches and not candidates:
         raise ValueError("Nessun export v5 riconosciuto nella cartella di origine.")
 
@@ -492,7 +795,7 @@ async def generate(source, destination, terminal):
     search_dir = await site.mkdir("ricerca")
     files_dir = await site.mkdir("file")
     rows = []
-    seen = set()
+    seen = {}
     excluded = set()
     shards = 0
     pending_search = []
@@ -518,23 +821,26 @@ async def generate(source, destination, terminal):
 
         if from_file and identifier != file_identifier:
             return False
-        if from_file:
-            excluded.add(from_file)
-        if identifier in seen:
-            return True
-
         title = string(summary.get("title")) or string(raw.get("title"))
-        stem = (
-            from_file.removesuffix(f"_{file_identifier}.json") if from_file
-            else individual_stem(identifier, title, candidates)
-        )
-        if stem and not from_file:
-            excluded.add(f"{stem}_{identifier}.json")
+        filename = from_file or individual_file(identifier, title, candidates)
+        stem = None
+        if filename:
+            stem = without_copy(filename).removesuffix(f"_{identifier}.json")
+            excluded.add(filename)
+        if identifier in seen:
+            if stem and not seen[identifier]["stem"]:
+                seen[identifier]["stem"] = stem
+            return True
         messages = prepare_messages(raw, fallback)
         key = str(len(rows) + 1)
-        refs = {ref["key"]: ref for message in messages for ref in message["refs"]}
+        refs = {}
+        for message in messages:
+            for ref in message["refs"]:
+                if ref["key"] not in refs or not ref.get("generic"):
+                    refs[ref["key"]] = ref
         row = {
             "key": key,
+            "id": identifier,
             "title": title or "Senza titolo",
             "safeTitle": sanitize(title),
             "stem": stem,
@@ -555,7 +861,7 @@ async def generate(source, destination, terminal):
         if pending_size >= SEARCH_SHARD_SIZE:
             await flush_search()
         rows.append(row)
-        seen.add(identifier)
+        seen[identifier] = row
         if len(rows) % 25 == 0:
             terminal.info(f"{len(rows)} conversazioni elaborate")
         await asyncio.sleep(0)
@@ -587,7 +893,7 @@ async def generate(source, destination, terminal):
             expected_name = f"{name.split('_', 1)[0]}_{sanitize(string(raw.get('title')))}_{identifier}.json"
             if not isinstance(raw.get("mapping"), dict):
                 continue
-            if not (canonical or explicit_id == identifier or name == expected_name):
+            if not (canonical or explicit_id == identifier or without_copy(name) == expected_name):
                 continue
             await add(raw, {}, from_file=name, file_identifier=identifier)
 
@@ -597,21 +903,26 @@ async def generate(source, destination, terminal):
     await flush_search()
     terminal.info(f"{len(rows)} conversazioni. Copia dei file associabili in corso.")
     known_stems = {row["stem"] for row in rows if row["stem"]}
-    asset_names = {
-        number: [name for name in names if name not in excluded]
-        for number, names in numbered.items()
-    }
+    asset_names = defaultdict(list)
+    assets = []
+    async for asset in collect_attachments(source, entries, excluded, terminal):
+        assets.append(asset)
+        if match := NUMBERED_NAME.fullmatch(asset.name):
+            asset_names[match[1]].append(asset.name)
     inferred = group_unknown(asset_names, rows, known_stems)
+    index = AttachmentIndex(rows, inferred)
+    for asset in assets:
+        index.add(asset)
+
     file_count = 0
+    linked_count = 0
     for row in rows:
         stem = row["stem"] or inferred.get(row["safeTitle"])
-        if not stem:
-            continue
-        number = stem.split("_", 1)[0]
-        files = await attach_files(source, files_dir, row, asset_names.get(number, ()), stem, excluded, terminal)
-        if files and files["all"]:
+        files = await attach_files(files_dir, chat_dir, row, index, stem, terminal)
+        if files["all"]:
             row["hasFiles"] = True
             file_count += len(files["all"])
+            linked_count += len(files["links"])
             await write_data(chat_dir, f"{row['key']}-file.js", "registraFile", {"key": row["key"], **files})
         await asyncio.sleep(0)
 
@@ -630,7 +941,11 @@ async def generate(source, destination, terminal):
     await write_text(site, "archivio.js", APP)
     await write_text(site, "indice.js", f"window.archivioIndice = {script_data(manifest)};\n")
     await write_text(site, "index.html", HTML)
-    terminal.done(f"Creato {site_name}/index.html · {len(rows)} chat · {file_count} file")
+    reference_count = sum(len(row["refs"]) for row in rows)
+    terminal.done(
+        f"Creato {site_name}/index.html · {len(rows)} chat · {file_count} file · "
+        f"{linked_count}/{reference_count} riferimenti a file collegati"
+    )
     return site_name
 
 
@@ -674,7 +989,7 @@ HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file:; style-src 'self' file:; img-src 'self' file:; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file:; style-src 'self' file:; img-src 'self' file:; media-src 'self' file:; frame-src 'self' file:; base-uri 'none'; form-action 'none'">
   <title>Archivio chat</title>
   <link rel="stylesheet" href="stile.css">
   <script defer src="indice.js"></script>
@@ -702,6 +1017,14 @@ HTML = r"""<!doctype html>
       <div class="placeholder"><h1>Apri una conversazione</h1><p>Sceglila dalla cronologia o usa la ricerca.</p></div>
     </article>
   </main>
+  <dialog id="attachment" aria-labelledby="attachment-title">
+    <header class="attachment-bar">
+      <h2 id="attachment-title"></h2>
+      <button class="icon" id="close-attachment" type="button" aria-label="Chiudi allegato" autofocus>✕</button>
+    </header>
+    <div id="attachment-content"></div>
+    <footer class="attachment-bar" id="attachment-actions"></footer>
+  </dialog>
 </body>
 </html>
 """
@@ -774,6 +1097,17 @@ main { min-height: 0; overflow: auto; }
 .message-image { display: block; max-width: 100%; max-height: 560px; width: auto; height: auto; margin-top: 9px; border-radius: 7px; object-fit: contain; }
 .extras { margin-top: 24px; border-top: 1px solid var(--edge); padding-top: 14px; }
 .extras summary { cursor: pointer; }
+#attachment { width: min(900px, 94vw); max-height: 90dvh; padding: 0; color: var(--ink); background: var(--surface); border: 1px solid var(--edge); border-radius: 14px; }
+#attachment::backdrop { background: #1c1824a6; }
+.attachment-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; }
+.attachment-bar h2 { min-width: 0; overflow-wrap: anywhere; font-size: 1rem; margin: 0; }
+#attachment-content { display: grid; place-items: center; background: var(--page); padding: 12px; overflow: auto; }
+#attachment-content iframe { display: block; border: 0; width: 100%; height: min(64dvh, 630px); }
+#attachment-content img, #attachment-content video { max-width: 100%; max-height: 64dvh; margin: 0; }
+#attachment-content audio { max-width: 100%; }
+#attachment-content p { margin: 16px; color: var(--muted); }
+#attachment-actions { justify-content: flex-end; }
+#attachment-actions .file { margin: 0; }
 @media (prefers-color-scheme: dark) {
   :root { color-scheme: dark; --page: #22212c; --surface: #292737; --ink: #f5f1fb; --muted: #c9c1d9; --edge: #434053; --accent: #d0b9ff; --bubble: #353046; }
   .prose code { background: #383248; }
@@ -801,7 +1135,7 @@ const make = (tag, text, className) => {
 };
 const fold = (value) => value.normalize("NFD").replace(/\p{M}/gu, "").toLocaleLowerCase("it");
 const validKey = (key) => /^\d+$/.test(key);
-const isImage = (file) => /\.(?:png|jpe?g|gif|webp|avif|bmp)$/i.test(file.name);
+const isImage = (file) => /\.(?:png|jpe?g|gif|webp|avif|bmp)$/i.test(file.url);
 const image = (file, alt) => {
   const node = make("img", undefined, "message-image");
   node.src = file.url;
@@ -813,8 +1147,47 @@ const fileLink = (file, label, inline = false) => {
   const link = make("a", label || file.name, inline ? undefined : "file");
   link.href = file.url;
   link.download = file.name;
+  link.setAttribute("aria-haspopup", "dialog");
+  link.addEventListener("click", (event) => {
+    event.preventDefault();
+    showAttachment(file, label);
+  });
   return link;
 };
+const linkedImage = (file, label) => {
+  const link = fileLink(file, label, true);
+  link.replaceChildren(image(file, label));
+  return link;
+};
+
+function showAttachment(file, label) {
+  const title = label || file.name;
+  byId("attachment-title").textContent = title;
+  const content = byId("attachment-content");
+  let preview;
+  if (isImage(file)) {
+    preview = image(file, title);
+  } else if (file.preview || file.pdf) {
+    preview = make("iframe");
+    preview.title = title;
+    if (file.preview) preview.setAttribute("sandbox", "");
+    preview.src = file.preview || file.url;
+  } else if (/\.(?:mp3|wav|ogg|m4a|mp4|webm)$/i.test(file.url)) {
+    preview = make(/\.(?:mp4|webm)$/i.test(file.url) ? "video" : "audio");
+    preview.controls = true;
+    preview.src = file.url;
+  } else {
+    preview = make("p", "Anteprima non disponibile per questo formato.");
+  }
+  content.replaceChildren(preview);
+  const download = make("a", "Scarica allegato", "file");
+  download.href = file.url;
+  download.download = file.name;
+  download.target = "_blank";
+  download.rel = "noopener noreferrer";
+  byId("attachment-actions").replaceChildren(download);
+  byId("attachment").showModal();
+}
 const externalLink = (href, label) => {
   try {
     const url = new URL(href);
@@ -845,7 +1218,7 @@ function inline(parent, text, files, used) {
         const file = Object.hasOwn(files, path) ? files[path] : null;
         if (file) {
           used.add(file.url);
-          parent.append(marker && isImage(file) ? image(file, label) : fileLink(file, label, true));
+          parent.append(marker && isImage(file) ? linkedImage(file, label) : fileLink(file, label, true));
         } else {
           parent.append(make("span", label + " (file non disponibile)", "in-line-missing"));
         }
@@ -1085,7 +1458,7 @@ function renderChat(chat, fileData) {
         if (!ref.inline) section.append(make("span", ref.name + " non disponibile", "missing"));
       } else if (!used.has(file.url) || !ref.inline) {
         const name = ref.generic ? file.name : ref.name;
-        if (ref.image && isImage(file)) section.append(image(file, name));
+        if (ref.image && isImage(file)) section.append(linkedImage(file, name));
         section.append(fileLink(file, name));
         used.add(file.url);
       }
@@ -1194,6 +1567,8 @@ byId("search").addEventListener("input", (event) => {
   }, 180);
 });
 byId("more").addEventListener("click", () => { limit += 120; showHistory(); });
+byId("close-attachment").addEventListener("click", () => byId("attachment").close());
+byId("attachment").addEventListener("close", () => byId("attachment-content").replaceChildren());
 byId("open-sidebar").addEventListener("click", () => { setSidebar(true); byId("search").focus(); });
 byId("close-sidebar").addEventListener("click", () => { setSidebar(false); byId("open-sidebar").focus(); });
 byId("history").addEventListener("click", (event) => {
