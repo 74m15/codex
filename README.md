@@ -2,7 +2,13 @@
 
 [Scarica il pacchetto ZIP](https://raw.githubusercontent.com/74m15/codex/main/archivio_chat_pyodide.zip) oppure apri [lo script Python](genera_archivio.py).
 
-`genera_archivio.py` legge la cartella creata da `exportChatGPTFullPagination-v5.js` e genera un sito statico. Usa la libreria standard di Python 3.14 e `asyncio` in un solo thread. I messaggi di avanzamento usano sequenze di colore ANSI compatibili con VT100.
+`genera_archivio.py` legge gli export v5 e v6 e genera un sito statico. Usa la libreria standard di Python 3.14 e `asyncio` in un solo thread. I messaggi di avanzamento usano sequenze di colore ANSI compatibili con VT100.
+
+## Esportazione delle chat
+
+Apri il workspace ChatGPT da esportare, esegui [`exportChatGPTFullPagination-v6.js`](exportChatGPTFullPagination-v6.js) nella console del browser e scegli una cartella vuota. Usa quella cartella come origine per `genera_archivio.py`.
+
+La v6 salva gli allegati con un nome come `0001_Titolo_file-abc123_Bilancio.pdf`. Il nome contiene l’ID completo e l’estensione, così il generatore può collegare anche allegati con lo stesso nome originale. I riferimenti scaduti o non disponibili vengono segnalati nella console.
 
 ## Con un worker Pyodide esistente
 
