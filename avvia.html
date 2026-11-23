@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Genera un archivio chat</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f8f7f3; color: #252337; font: 1rem/1.5 system-ui, sans-serif; }
+    main { width: min(100% - 32px, 770px); margin: clamp(32px, 9vh, 92px) auto; }
+    h1 { margin-bottom: 6px; font-size: clamp(1.8rem, 5vw, 2.6rem); letter-spacing: -.04em; }
+    p { color: #5b566b; }
+    section { margin: 26px 0; display: grid; gap: 12px; }
+    .folder { display: flex; align-items: center; gap: 14px; justify-content: space-between; border-bottom: 1px solid #ddd9e3; padding: 10px 0; }
+    .folder span { overflow-wrap: anywhere; text-align: right; }
+    button { background: #fff; color: inherit; border: 1px solid #bcb5cb; border-radius: 7px; padding: 8px 12px; cursor: pointer; font: inherit; flex-shrink: 0; }
+    button:focus-visible { outline: 2px solid #683ca4; outline-offset: 3px; }
+    #generate { background: #503780; border-color: #503780; color: #fff; font-weight: 650; }
+    button:disabled { opacity: .56; cursor: default; }
+    #status { min-height: 1.5em; }
+    #terminal { margin: 0; padding: 17px; overflow: auto; max-height: 45vh; min-height: 150px; white-space: pre-wrap; overflow-wrap: anywhere; background: #211e31; border-radius: 7px; color: #f2edf7; font: .87rem/1.55 ui-monospace, monospace; }
+    .c31 { color: #ff929d; } .c32 { color: #8fe7ab; } .c33 { color: #ffe397; } .c36 { color: #9ae5ee; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Genera un archivio chat</h1>
+    <p>Scegli la cartella con i file esportati e la cartella in cui salvare il sito.</p>
+    <section aria-label="Cartelle">
+      <div class="folder"><button id="pick-input" type="button">Scegli origine</button><span id="name-input">Nessuna cartella</span></div>
+      <div class="folder"><button id="pick-output" type="button">Scegli destinazione</button><span id="name-output">Nessuna cartella</span></div>
+    </section>
+    <button id="generate" type="button" disabled>Genera archivio</button>
+    <p id="status" role="status"></p>
+    <pre id="terminal" tabindex="0" aria-label="Registro della generazione"></pre>
+  </main>
+<script>
+  "use strict";
+  const byId = (id) => document.getElementById(id);
+  const terminal = byId("terminal");
+  const state = {input: null, output: null, running: false};
+  let worker;
+  const supported = Boolean(window.isSecureContext && window.showDirectoryPicker);
+
+  function update() {
+    byId("pick-input").disabled = !supported || state.running;
+    byId("pick-output").disabled = !supported || state.running;
+    byId("generate").disabled = !supported || state.running || !state.input || !state.output;
+  }
+
+  function log(line) {
+    const pieces = line.split(/\x1b\[(0|31|32|33|36)m/);
+    for (let i = 0; i < pieces.length; i += 2) {
+      const span = document.createElement("span");
+      if (i && pieces[i - 1] !== "0") span.className = "c" + pieces[i - 1];
+      span.textContent = pieces[i];
+      terminal.append(span);
+    }
+    terminal.append("\n");
+    terminal.scrollTop = terminal.scrollHeight;
+  }
+
+  if (!supported) {
+    byId("status").textContent = "Apri questa pagina su localhost o HTTPS in un browser Chromium con accesso alle cartelle.";
+  }
+  for (const role of ["input", "output"]) {
+    byId("pick-" + role).addEventListener("click", async () => {
+      try {
+        const mode = role === "input" ? "read" : "readwrite";
+        const folder = await showDirectoryPicker({mode});
+        if (await folder.queryPermission({mode}) !== "granted") {
+          byId("status").textContent = "Il browser non ha concesso l’accesso a " + folder.name + ".";
+          return;
+        }
+        state[role] = folder;
+        byId("name-" + role).textContent = folder.name;
+        byId("status").textContent = "";
+        update();
+      } catch (error) {
+        if (error.name !== "AbortError") byId("status").textContent = error.message;
+      }
+    });
+  }
+
+  function finish(message, failed = false) {
+    state.running = false;
+    byId("status").textContent = message;
+    if (failed) log("\x1b[31m ERRORE \x1b[0m  " + message);
+    update();
+  }
+
+  function getWorker() {
+    if (worker) return worker;
+    const script = new URL("worker.js", location.href);
+    if (new URLSearchParams(location.search).has("locale")) script.searchParams.set("locale", "1");
+    worker = new Worker(script, {type: "module"});
+    worker.addEventListener("message", ({data}) => {
+      if (data.type === "log") log(data.line);
+      if (data.type === "complete") {
+        finish("Apri " + data.name + "/index.html dalla cartella di destinazione.");
+      }
+      if (data.type === "failure") finish(data.message, true);
+    });
+    worker.addEventListener("error", (event) => {
+      worker?.terminate();
+      worker = undefined;
+      finish(event.message || "Avvio del web worker fallito.", true);
+    });
+    return worker;
+  }
+
+  byId("generate").addEventListener("click", () => {
+    terminal.replaceChildren();
+    state.running = true;
+    update();
+    byId("status").textContent = "Generazione in corso…";
+    try {
+      getWorker().postMessage({type: "generate", input: state.input, output: state.output});
+    } catch (error) {
+      finish(error.message, true);
+    }
+  });
+  update();
+</script>
+</body>
+</html>
