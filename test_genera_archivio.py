@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from urllib.parse import unquote
 
 from genera_archivio import genera_da_cartelle
 
@@ -22,6 +23,7 @@ class AttachmentTests(unittest.TestCase):
             report = "3x8e4tPkAD25c9LjYr67gF"
             image = "00000000a94882bbf63e980997d3111e"
             partial = "00000000b62849cabcd532814e89175e"
+            audio = "00000000adb6497a8e639a4701c13606"
             raw = {
                 "conversation_id": identifier,
                 "title": "Titolo aggiornato",
@@ -40,6 +42,14 @@ class AttachmentTests(unittest.TestCase):
                         {"id": f"file_{partial}", "name": "Sottotitoli.txt"},
                         {"file_id": "file_fallback", "filename": "Relazione consolidata.txt"},
                         {"id": "file_missing", "name": "Rapporto 2025.pdf"},
+                        {"id": "file_abc", "name": "Versione corta.pdf"},
+                    ]},
+                }}, "alternativo": {"message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["Testo del ramo alternativo"]},
+                    "metadata": {"attachments": [
+                        {"id": f"file_{audio}", "name": "Lettura", "mime_type": "audio/wav"},
+                        {"id": "file_abcd"},
                     ]},
                 }}},
             }
@@ -51,9 +61,12 @@ class AttachmentTests(unittest.TestCase):
             (source / "0001_Titolo_precedente_Relazzione_consolidata.txt").write_text("<script>pericolo</script>")
             (source / "0001_Titolo_precedente_Rapporto_2024.pdf").write_bytes(b"%PDF-1.7\nanno diverso")
             (source / "0001_Titolo_precedente_generated_image.png").write_bytes(b"Immagine senza ID nel nome")
-            (assets / f"0098_file_vecchio_nome_file_{report}_rinominato (1).pdf").write_bytes(b"%PDF-1.7\nID giusto")
-            (assets / f"file-{image}.png").write_bytes(b"PNG di prova")
+            (assets / f"0098_vecchionomefile_{report}rinominato (1).bin").write_bytes(b"%PDF-1.7\nID giusto")
+            png = b"\x89PNG\r\n\x1a\nContenuto di prova"
+            (assets / f"copia{image}finale.download").write_bytes(png)
             (assets / f"file_{partial[:-5]}").write_bytes(b"ID troncato")
+            (assets / f"audioFILE-{audio}recuperato").write_bytes(b"\x00audio\xff")
+            (assets / "nomefile-abcdversione").write_bytes(b"\x00File sconosciuto\xff")
 
             site = destination / asyncio.run(genera_da_cartelle(source, destination, False))
             manifest = (site / "chat/1-file.js").read_text()
@@ -62,13 +75,21 @@ class AttachmentTests(unittest.TestCase):
 
             self.assertEqual(set(links), {
                 f"file_{report}", f"file_{image}", f"file_{partial}", "file_fallback", "file_senza_nome",
+                f"file_{audio}", "file_abcd",
             })
             self.assertEqual((site / links[f"file_{report}"]["url"]).read_bytes(), b"%PDF-1.7\nID giusto")
+            self.assertEqual(links[f"file_{report}"]["name"], "Budget.pdf")
             self.assertTrue(links[f"file_{report}"]["pdf"])
-            self.assertEqual((site / links[f"file_{image}"]["url"]).read_bytes(), b"PNG di prova")
+            self.assertEqual(links[f"file_{image}"]["name"], "copiafinale.png")
+            self.assertEqual((site / links[f"file_{image}"]["url"]).read_bytes(), png)
             self.assertEqual((site / links[f"file_{partial}"]["url"]).read_bytes(), b"ID troncato")
-            self.assertTrue(links[f"file_{partial}"]["url"].endswith(".txt"))
-            self.assertEqual(links["file_senza_nome"]["name"], "generated_image.png")
+            self.assertEqual(links[f"file_{partial}"]["name"], "Sottotitoli.txt")
+            self.assertEqual(links[f"file_{audio}"]["name"], "Lettura.wav")
+            self.assertEqual(links["file_abcd"]["name"], "nomeversione.bin")
+            self.assertEqual(links["file_senza_nome"]["name"], "generated image.png")
+            self.assertTrue((site / unquote(links["file_fallback"]["url"])).is_file())
+            self.assertNotIn("Testo del ramo alternativo", (site / "chat/1.js").read_text())
+            self.assertIn("Budget (2).pdf", [file["name"] for file in data["all"]])
             text_preview = (site / links["file_fallback"]["preview"]).read_text()
             self.assertIn("&lt;script&gt;pericolo&lt;/script&gt;", text_preview)
             self.assertNotIn("<script>", text_preview)
