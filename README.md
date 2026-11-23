@@ -38,6 +38,8 @@ Per collegare un allegato, il generatore cerca prima il suo ID ovunque nel nome 
 
 Le copie degli allegati usano il nome originale dei metadati quando è disponibile, oppure un nome ricavato dal file, ripulito dagli ID. L’estensione si basa sul contenuto, sul nome o sul tipo MIME. Il generatore usa `.bin` quando il formato resta sconosciuto. I file con lo stesso nome ricevono un suffisso numerico.
 
-La sezione **Allegati** in fondo alla conversazione elenca tutti i file trovati e segnala quelli mancanti. Il clic apre un popup sopra la chat. Immagini, PDF, file di testo e i formati audio e video supportati dal browser hanno un’anteprima. Il pulsante **Scarica allegato** è disponibile per tutti i formati. Per applicare un aggiornamento, rigenera il sito dalla cartella dell’export originale.
+Gli allegati del ramo visibile compaiono nel punto indicato dal `mapping`, oppure accanto al messaggio quando la posizione è indicata solo nei metadati. In fondo alla conversazione, **Allegati** raccoglie tutti i file trovati. Al suo interno, **Allegati non disponibili** elenca gli ID o i riferimenti rimasti senza file. Entrambe le sezioni sono chiuse all’apertura della conversazione.
 
-Il sito visualizza i costrutti Markdown più comuni, inclusi blocchi di codice, elenchi, citazioni e tabelle semplici. I blocchi Canvas esportati sono disponibili come file Markdown scaricabili.
+Il clic apre un popup sopra la chat. Immagini, PDF, file di testo e i formati audio e video supportati dal browser hanno un’anteprima. Il pulsante **Scarica allegato** è disponibile per tutti i formati. Per applicare un aggiornamento, rigenera il sito dalla cartella dell’export originale.
+
+Il sito visualizza i costrutti Markdown più comuni, inclusi blocchi di codice, elenchi, citazioni e tabelle semplici. Riconosce anche `<WritingBlock>`, `<box>` e `<caption>` come elementi di visualizzazione. Quando l’export include il contenuto nei metadati, il testo del blocco di scrittura viene recuperato da lì. I blocchi Canvas esportati sono disponibili anche come file Markdown scaricabili. I tag negli esempi di codice restano letterali.

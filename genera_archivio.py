@@ -295,17 +295,25 @@ def add_file_ref(refs, data, identifier, image=False):
         (data[field] for field in ("name", "filename", "file_name", "fileName") if string(data.get(field))),
         "",
     )
-    if not identifier and not title:
+    source_id = string(data.get("id") or data.get("file_id"))
+    if not identifier and not title and not source_id:
         return
-    key = file_key(identifier) if identifier else f"nome:{title}"
+    if identifier:
+        key = file_key(identifier)
+    elif source_id:
+        key = f"riferimento:{source_id}"
+    else:
+        key = f"nome:{title}"
     previous = refs.get(key, {})
     title = title or (previous["name"] if previous and not previous.get("generic") else "")
     mime = string(data.get("mime_type") or data.get("mimeType") or previous.get("mime"))
     image = image or previous.get("image", False) or mime.startswith("image/")
     refs[key] = {
-        "key": key, "id": identifier, "name": title or ("Immagine" if image else "Allegato"),
+        "key": key, "id": identifier, "source_id": source_id,
+        "name": title or ("Immagine" if image else "Allegato"),
         "image": image, "generic": not title, "mime": mime,
     }
+    return key
 
 
 def path_nodes(raw):
@@ -360,26 +368,36 @@ def prepare_messages(raw, fallback):
         content = obj(message.get("content"))
         metadata = obj(message.get("metadata"))
         text_parts = []
+        parts = []
         refs = {}
+        blocks = []
 
         for part in array(content.get("parts")):
             if isinstance(part, str):
                 text_parts.append(part)
+                parts.append(part)
                 continue
             if not isinstance(part, dict):
                 continue
             text = string(part.get("text"))
             if text:
                 text_parts.append(text)
+                parts.append(text)
             pointer = part.get("asset_pointer") or part.get("file_id")
             if pointer:
                 asset = file_id(pointer, allow_bare=not part.get("asset_pointer"))
-                add_file_ref(refs, part, asset, part.get("content_type") == "image_asset_pointer")
+                if key := add_file_ref(refs, part, asset, part.get("content_type") == "image_asset_pointer"):
+                    parts.append({"ref": key})
 
         body = "\n".join(text_parts) or string(content.get("text"))
+        if not text_parts and body:
+            parts.insert(0, body)
         if in_path and body and content.get("content_type") in ("code", "execution_output"):
             fence = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", body)), default=0))
-            body = f"{fence}\n{body}\n{fence}"
+            if any(isinstance(part, dict) for part in parts):
+                parts = [f"{fence}\n{part}\n{fence}" if isinstance(part, str) else part for part in parts]
+            else:
+                parts = [f"{fence}\n{body}\n{fence}"]
 
         for attachment in array(metadata.get("attachments")):
             attachment = obj(attachment)
@@ -394,7 +412,7 @@ def prepare_messages(raw, fallback):
 
         for match in SANDBOX_LINK.finditer(body):
             path = unquote(match[1])
-            refs[path] = {"key": path, "name": path.rsplit("/", 1)[-1], "inline": True}
+            refs[path] = {"key": path, "name": path.rsplit("/", 1)[-1]}
         app_data = obj(obj(metadata.get("model_dil_v2")).get("appData"))
         for component in obj(obj(app_data.get("opGenui")).get("componentResults")).values():
             path = sandbox_path(obj(obj(component).get("state")).get("url"))
@@ -402,18 +420,27 @@ def prepare_messages(raw, fallback):
                 refs[path] = {"key": path, "name": path.rsplit("/", 1)[-1]}
 
         for canvas_id, block in obj(metadata.get("writing_blocks")).items():
-            if obj(block).get("content"):
-                key = f"Canvas_{canvas_id}.md"
-                refs[key] = {"key": key, "name": "Canvas.md", "match_name": key}
+            block = obj(block)
+            value = block.get("content")
+            if not value:
+                continue
+            key = f"Canvas_{canvas_id}.md"
+            title = string(block.get("title") or block.get("subject"))
+            text = string(value) or string(obj(value).get("text"))
+            refs[key] = {"key": key, "name": "Canvas.md", "match_name": key, "source_id": canvas_id}
+            blocks.append({"id": canvas_id, "title": title, "text": text, "ref": key})
 
         for key, ref in refs.items():
             previous = combined_refs.get(key)
             if previous is None or (previous.get("generic") and not ref.get("generic")):
                 combined_refs[key] = ref
-        if in_path and body.strip():
-            messages.append({"role": obj(message["author"])["role"], "text": body})
+        if in_path and (body.strip() or refs):
+            messages.append({
+                "role": obj(message["author"])["role"],
+                "parts": parts, "refs": list(refs), "blocks": blocks,
+            })
     if not messages and not obj(raw.get("mapping")) and fallback.strip():
-        messages.append({"role": "transcript", "text": fallback})
+        messages.append({"role": "transcript", "parts": [fallback], "refs": [], "blocks": []})
     return messages, combined_refs
 
 
@@ -976,10 +1003,15 @@ async def generate(source, destination, terminal):
         await write_data(chat_dir, f"{key}.js", "registraChat", {
             "key": key,
             "messages": messages,
-            "refs": [{"key": ref["key"], "name": ref["name"]} for ref in refs.values()],
+            "refs": [{
+                "key": ref["key"], "name": ref["name"], "image": ref.get("image", False),
+                "id": ref.get("id") or ref.get("source_id") or (ref["key"] if ref["key"].startswith("/") else ""),
+            } for ref in refs.values()],
         })
         search = "\n".join(
-            [row["title"], *(message["text"] for message in messages)]
+            [row["title"]]
+            + [part for message in messages for part in message["parts"] if isinstance(part, str)]
+            + [block["text"] for message in messages for block in message["blocks"]]
             + [ref["name"] for ref in refs.values() if not ref.get("generic")]
         )
         size = len(search.encode("utf-8", "backslashreplace"))
@@ -1224,11 +1256,19 @@ main { min-height: 0; overflow: auto; }
 .missing { color: var(--muted); }
 .in-line-missing { color: var(--muted); }
 .message-image { display: block; max-width: 100%; max-height: 560px; width: auto; height: auto; margin-top: 9px; border-radius: 7px; object-fit: contain; }
+.mapped-image { margin: 9px 0 0; }
+.message-box, .message-writing { margin: 10px 0; padding: 12px 14px; border: 1px solid var(--edge); border-radius: 7px; }
+.message-writing { background: var(--surface); }
+.prose .writing-title { margin: 0 0 8px; font-weight: 650; }
+.message-caption { margin: 6px 0; color: var(--muted); font-size: .92rem; }
 .attachments { margin-top: 24px; border-top: 1px solid var(--edge); padding-top: 14px; }
-.attachments h2 { margin: 0 0 8px; font-size: 1rem; }
-.attachment-list { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; margin: 0; padding: 0; }
+.attachments > summary { font-weight: 650; }
+.attachments summary { cursor: pointer; }
+.attachment-list { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; margin: 8px 0; padding: 0; }
 .attachment-list li { min-width: 0; max-width: 100%; }
-.attachment-list .file, .attachment-list .missing { margin: 0; max-width: 100%; }
+.attachment-list .file { margin: 0; max-width: 100%; }
+.missing-files { margin-top: 10px; color: var(--muted); }
+.missing-files li { overflow-wrap: anywhere; }
 #attachment { width: min(900px, 94vw); max-height: 90dvh; padding: 0; color: var(--ink); background: var(--surface); border: 1px solid var(--edge); border-radius: 14px; }
 #attachment::backdrop { background: #1c1824a6; }
 .attachment-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; }
@@ -1334,7 +1374,7 @@ const externalLink = (href, label) => {
   }
 };
 
-function inline(parent, text, files) {
+function inline(parent, text, view) {
   // Precedenza a codice e link. L'HTML sorgente rimane testo.
   const token = /(\x60+)(.+?)\1|(!?)\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)|(\*\*|__|~~)([^\n]+?)\6|(\*|_)([^\n]+?)\8|\\([\\\x60*_{}\[\]()#+.!>|~-])/g;
   let offset = 0;
@@ -1347,7 +1387,8 @@ function inline(parent, text, files) {
       if (href.startsWith("sandbox:/mnt/data/")) {
         let path = href.slice("sandbox:".length);
         try { path = decodeURIComponent(path); } catch { /* mantiene il percorso originale */ }
-        const file = Object.hasOwn(files, path) ? files[path] : null;
+        view.shown.add(path);
+        const file = Object.hasOwn(view.files, path) ? view.files[path] : null;
         if (file) {
           parent.append(marker && isImage(file) ? linkedImage(file, label) : fileLink(file, label, true));
         } else {
@@ -1376,7 +1417,7 @@ const rule = /^ {0,3}(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$/;
 const cells = (line) => line.trim().replace(/^\||\|$/g, "").split("|").map((cell) => cell.trim());
 const tableSeparator = (line) => line.includes("|") && cells(line).every((cell) => /^:?-{3,}:?$/.test(cell));
 
-function renderMarkdown(container, text, files, depth = 0) {
+function renderMarkdown(container, text, view, depth = 0) {
   const lines = text.replace(/\r\n?/g, "\n").split("\n");
   let i = 0;
   const startsBlock = (line) => fence.test(line) || heading.test(line) || listItem.test(line) || quote.test(line) || rule.test(line);
@@ -1400,7 +1441,7 @@ function renderMarkdown(container, text, files, depth = 0) {
     const header = line.match(heading);
     if (header) {
       const node = make("h" + Math.min(1 + header[1].length, 6));
-      inline(node, header[2].replace(/\s+#+\s*$/, ""), files);
+      inline(node, header[2].replace(/\s+#+\s*$/, ""), view);
       container.append(node);
       i += 1;
       continue;
@@ -1420,7 +1461,7 @@ function renderMarkdown(container, text, files, depth = 0) {
       for (const text of headerCells) {
         const cell = make("th");
         cell.scope = "col";
-        inline(cell, text, files);
+        inline(cell, text, view);
         head.append(cell);
       }
       const body = table.createTBody();
@@ -1429,7 +1470,7 @@ function renderMarkdown(container, text, files, depth = 0) {
         const row = body.insertRow();
         const parts = cells(lines[i++]);
         for (let col = 0; col < headerCells.length; col += 1) {
-          inline(row.insertCell(), parts[col] || "", files);
+          inline(row.insertCell(), parts[col] || "", view);
         }
       }
       wrapper.append(table);
@@ -1446,7 +1487,7 @@ function renderMarkdown(container, text, files, depth = 0) {
         const next = lines[i].match(listItem);
         if (!next || Boolean(next[2]) !== ordered || rule.test(lines[i])) break;
         const li = make("li");
-        inline(li, next[3], files);
+        inline(li, next[3], view);
         list.append(li);
         i += 1;
       }
@@ -1463,22 +1504,186 @@ function renderMarkdown(container, text, files, depth = 0) {
         body.push(next[1]);
         i += 1;
       }
-      renderMarkdown(block, body.join("\n"), files, depth + 1);
+      renderMarkdown(block, body.join("\n"), view, depth + 1);
       container.append(block);
       continue;
     }
 
     const paragraph = make("p");
-    inline(paragraph, line, files);
+    inline(paragraph, line, view);
     i += 1;
     while (i < lines.length && lines[i].trim() && !startsBlock(lines[i])) {
       if (lines[i].includes("|") && i + 1 < lines.length && tableSeparator(lines[i + 1])) break;
       if (/ {2}$/.test(lines[i - 1])) paragraph.append(make("br"));
       else paragraph.append(" ");
-      inline(paragraph, lines[i], files);
+      inline(paragraph, lines[i], view);
       i += 1;
     }
     container.append(paragraph);
+  }
+}
+
+const styledToken = /^ {0,3}(?<fence>\x60{3,}|~{3,})[^\r\n]*|(?<code>\x60+)|\\?(?:<|&lt;)(?<closing>\/?)(?<tag>writingblock|box|caption)(?=[\s/>]|&gt;)(?<attributes>[^<>\r\n]{0,1024}?)(?:>|&gt;)/gim;
+
+function* markupTokens(text) {
+  const scan = new RegExp(styledToken);
+  let offset = 0;
+  for (let match; (match = scan.exec(text));) {
+    const token = match.groups;
+    if (token.fence) {
+      const end = new RegExp("^ {0,3}" + token.fence[0] + "{" + token.fence.length + ",}[ \\t]*\\r?$", "gm");
+      end.lastIndex = scan.lastIndex;
+      scan.lastIndex = end.exec(text) ? end.lastIndex : text.length;
+    } else if (token.code) {
+      const end = text.indexOf(token.code, scan.lastIndex);
+      const lineEnd = text.indexOf("\n", scan.lastIndex);
+      if (end >= 0 && (lineEnd < 0 || end < lineEnd)) scan.lastIndex = end + token.code.length;
+    } else {
+      if (offset < match.index) yield text.slice(offset, match.index);
+      yield {tag: token.tag.toLowerCase(), closing: Boolean(token.closing), attributes: token.attributes, raw: match[0]};
+      offset = scan.lastIndex;
+    }
+  }
+  if (offset < text.length) yield text.slice(offset);
+}
+
+function styledParts(parts) {
+  const root = {children: []};
+  const stack = [root];
+  const append = (token) => {
+    const parent = stack.at(-1);
+    if (typeof token === "string" || !token.tag) {
+      parent.children.push(token);
+    } else if (token.closing) {
+      const open = stack.findLastIndex((node) => node.tag === token.tag);
+      if (open > 0) {
+        stack[open].closed = true;
+        stack.length = open;
+      }
+    } else if (stack.length < 32) {
+      const ended = token.attributes.trimEnd().endsWith("/");
+      const node = {...token, closed: ended, children: []};
+      parent.children.push(node);
+      if (!ended) stack.push(node);
+    } else {
+      parent.children.push(token.raw);
+    }
+  };
+
+  let run = [];
+  const flush = () => {
+    for (const token of markupTokens(run.join("\n"))) append(token);
+    run = [];
+  };
+  for (const part of parts) {
+    if (typeof part === "string") {
+      run.push(part);
+    } else {
+      flush();
+      append(part);
+    }
+  }
+  flush();
+  return root.children;
+}
+
+function mappedAttachment(container, key, view) {
+  const ref = view.refs.get(key);
+  if (!ref) return;
+  view.shown.add(key);
+  if (!Object.hasOwn(view.files, key)) {
+    container.append(make("span", ref.name + " non disponibile", "missing"));
+    return;
+  }
+  const file = view.files[key];
+  if (ref.image && isImage(file)) {
+    const figure = make("figure", undefined, "mapped-image");
+    figure.append(linkedImage(file, file.name));
+    container.append(figure);
+  } else {
+    container.append(fileLink(file));
+  }
+}
+
+function blockAttributes(source) {
+  const decoded = source.replace(/&quot;|&apos;|&#39;/g, (entity) => entity === "&quot;" ? '"' : "'");
+  const attributes = new Map();
+  const pattern = /([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s/]+))/g;
+  for (const match of decoded.matchAll(pattern)) {
+    attributes.set(match[1].toLowerCase(), match[2] ?? match[3] ?? match[4]);
+  }
+  return attributes;
+}
+
+function writingBlock(container, node, view) {
+  const attributes = blockAttributes(node.attributes);
+  const children = node.children.filter((child) => typeof child !== "string" || child.trim());
+  const innerId = children.length === 1 && typeof children[0] === "string" ? children[0].trim() : "";
+  const explicitId = attributes.get("id") || attributes.get("block-id") || attributes.get("block_id")
+    || attributes.get("data-block-id");
+  let block = view.blocks.get(explicitId || innerId);
+  if (!block && !explicitId) {
+    const remaining = [...view.blocks.values()].filter((entry) => !view.usedBlocks.has(entry.id));
+    if (remaining.length === 1) block = remaining[0];
+  }
+
+  const element = make("div", undefined, "message-writing");
+  const title = attributes.get("title") || attributes.get("subject") || block?.title || "Blocco di scrittura";
+  element.append(make("p", title, "writing-title"));
+  const hasInline = children.length > 0 && innerId !== block?.id;
+  const useSaved = block?.text && (!hasInline || !node.closed);
+  if (useSaved) {
+    renderMarkdown(element, block.text, view);
+  } else if (hasInline) {
+    renderStyled(element, node.children, view);
+  } else if (!block || !Object.hasOwn(view.files, block.ref)) {
+    element.append(make("p", "Contenuto del blocco non disponibile.", "in-line-missing"));
+  }
+  if (block) {
+    view.usedBlocks.add(block.id);
+    view.shown.add(block.ref);
+    if (Object.hasOwn(view.files, block.ref)) mappedAttachment(element, block.ref, view);
+  }
+  container.append(element);
+  if (useSaved && !node.closed && hasInline) renderStyled(container, node.children, view);
+}
+
+function renderStyled(container, parts, view) {
+  for (const part of parts) {
+    if (typeof part === "string") {
+      renderMarkdown(container, part, view);
+    } else if (part.ref) {
+      mappedAttachment(container, part.ref, view);
+    } else if (part.tag === "writingblock") {
+      writingBlock(container, part, view);
+    } else {
+      const nested = make("div", undefined, "message-" + part.tag);
+      renderStyled(nested, part.children, view);
+      container.append(nested);
+    }
+  }
+}
+
+function renderMessage(container, message, files, refs) {
+  const view = {
+    files, refs, shown: new Set(), usedBlocks: new Set(),
+    blocks: new Map(message.blocks.map((block) => [block.id, block])),
+  };
+  renderStyled(container, styledParts(message.parts), view);
+  const rawText = message.parts.filter((part) => typeof part === "string").join("\n");
+  for (const block of message.blocks) {
+    if (block.text && !view.usedBlocks.has(block.id) && !rawText.includes(block.text.trim())) {
+      // Il blocco salvato nei metadati può non avere un marcatore testuale.
+      const element = make("div", undefined, "message-writing");
+      element.append(make("p", block.title || "Blocco di scrittura", "writing-title"));
+      renderMarkdown(element, block.text, view);
+      view.shown.add(block.ref);
+      if (Object.hasOwn(files, block.ref)) mappedAttachment(element, block.ref, view);
+      container.append(element);
+    }
+  }
+  for (const key of message.refs) {
+    if (!view.shown.has(key)) mappedAttachment(container, key, view);
   }
 }
 
@@ -1574,13 +1779,14 @@ function setSidebar(open) {
 function renderChat(chat, fileData) {
   const article = byId("conversation");
   const files = fileData.links;
+  const refs = new Map(chat.refs.map((ref) => [ref.key, ref]));
   const content = document.createDocumentFragment();
   for (const message of chat.messages) {
     const section = make("section", undefined, "message " + message.role);
     const label = {user: "Utente", assistant: "ChatGPT", transcript: "Trascrizione"};
     section.append(make("p", label[message.role], "role"));
     const prose = make("div", undefined, "prose");
-    renderMarkdown(prose, message.text, files);
+    renderMessage(prose, message, files, refs);
     section.append(prose);
     content.append(section);
   }
@@ -1588,22 +1794,36 @@ function renderChat(chat, fileData) {
 
   const missing = chat.refs.filter((ref) => !Object.hasOwn(files, ref.key));
   if (fileData.all.length || missing.length) {
-    const attachments = make("section", undefined, "attachments");
-    const title = make("h2", "Allegati");
-    title.id = "attachments-title";
-    attachments.setAttribute("aria-labelledby", title.id);
-    const list = make("ul", undefined, "attachment-list");
-    for (const file of fileData.all) {
-      const item = make("li");
-      item.append(fileLink(file));
-      list.append(item);
+    const attachments = make("details", undefined, "attachments");
+    attachments.append(make("summary", "Allegati"));
+    if (fileData.all.length) {
+      const list = make("ul", undefined, "attachment-list");
+      for (const file of fileData.all) {
+        const item = make("li");
+        item.append(fileLink(file));
+        list.append(item);
+      }
+      attachments.append(list);
     }
-    for (const ref of missing) {
-      const item = make("li");
-      item.append(make("span", ref.name + " non disponibile", "missing"));
-      list.append(item);
+    const unavailable = make("details", undefined, "missing-files");
+    unavailable.append(make("summary", "Allegati non disponibili"));
+    if (missing.length) {
+      const list = make("ul");
+      for (const ref of missing) {
+        const item = make("li");
+        if (ref.id) {
+          item.append(make("code", ref.id));
+          if (ref.name && ref.name !== ref.id) item.append(" · " + ref.name);
+        } else {
+          item.textContent = ref.name + " (senza ID)";
+        }
+        list.append(item);
+      }
+      unavailable.append(list);
+    } else {
+      unavailable.append(make("p", "Nessun allegato mancante."));
     }
-    attachments.append(title, list);
+    attachments.append(unavailable);
     content.append(attachments);
   }
   article.replaceChildren(content);

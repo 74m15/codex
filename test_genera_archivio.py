@@ -5,10 +5,36 @@ from tempfile import TemporaryDirectory
 import unittest
 from urllib.parse import unquote
 
-from genera_archivio import genera_da_cartelle
+from genera_archivio import genera_da_cartelle, prepare_messages
 
 
 class AttachmentTests(unittest.TestCase):
+    def test_conserva_la_posizione_dei_file_e_i_metadati_del_blocco(self):
+        raw = {"current_node": "msg", "mapping": {"msg": {"message": {
+            "author": {"role": "assistant"},
+            "content": {"parts": [
+                "Prima",
+                {"asset_pointer": "sediment://file_immagine", "content_type": "image_asset_pointer"},
+                "Dopo\n<WritingBlock id='scrittura'/>",
+            ]},
+            "metadata": {
+                "attachments": [{"id": "file-assente", "name": "Documento.pdf"}, {"id": "user-legacy"}],
+                "writing_blocks": {"scrittura": {"subject": "Oggetto", "content": "Corpo salvato"}},
+            },
+        }}}}
+        messages, refs = prepare_messages(raw, "")
+        self.assertEqual(messages[0]["parts"], [
+            "Prima", {"ref": "file_immagine"}, "Dopo\n<WritingBlock id='scrittura'/>",
+        ])
+        self.assertEqual(messages[0]["refs"], [
+            "file_immagine", "file_assente", "riferimento:user-legacy", "Canvas_scrittura.md",
+        ])
+        self.assertEqual(refs["file_assente"]["id"], "file-assente")
+        self.assertEqual(refs["riferimento:user-legacy"]["source_id"], "user-legacy")
+        self.assertEqual(messages[0]["blocks"], [{
+            "id": "scrittura", "title": "Oggetto", "text": "Corpo salvato", "ref": "Canvas_scrittura.md",
+        }])
+
     def test_recupera_id_nell_export_e_limita_il_ripiego_per_nome(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
