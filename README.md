@@ -1,6 +1,6 @@
 # Generatore di archivio chat
 
-[Scarica il pacchetto ZIP o lo script Python dalla release](https://github.com/74m15/codex/releases/latest).
+[Scarica il pacchetto ZIP](https://raw.githubusercontent.com/74m15/codex/main/archivio_chat_pyodide.zip) oppure apri [lo script Python](genera_archivio.py).
 
 `genera_archivio.py` legge la cartella creata da `exportChatGPTFullPagination-v5.js` e genera un sito statico. Usa la libreria standard di Python 3.14 e `asyncio` in un solo thread. I messaggi di avanzamento usano sequenze di colore ANSI compatibili con VT100.
 
