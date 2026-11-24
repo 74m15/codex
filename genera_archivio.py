@@ -1284,6 +1284,9 @@ main { min-height: 0; overflow: auto; }
 .formula { white-space: normal; }
 .formula-display { display: block; overflow: auto; margin: .8em 0; padding: 2px 0; text-align: center; }
 .citation { margin-inline: 2px; font-size: .84em; overflow-wrap: anywhere; }
+.each-list > li + li { margin-top: .55em; }
+.each-list > li > :first-child { margin-top: 0; }
+.each-list > li > :last-child { margin-bottom: 0; }
 .prose table { border-collapse: collapse; width: 100%; background: var(--surface); }
 .prose th, .prose td { border: 1px solid var(--edge); text-align: left; padding: 7px 10px; }
 .table-scroll { margin: 1em 0; overflow: auto; }
@@ -1427,7 +1430,20 @@ const externalLink = (href, label) => {
   }
 };
 
-const inlineToken = /(?<tick>\x60+)(?<code>.+?)\k<tick>|(?<formula>\uFDD0(?<formulaId>\d+)\uFDD1)|(?<reference>\uE200[a-z][\w-]*\uE202[^\uE200\uE201]*\uE201)|(?<image>!?)\[(?<label>[^\]\n]+)\]\((?<href>(?:[^()\s]|\([^()\s]*\))+)\)|(?<strong>\*\*|__|~~)(?<strongText>[^\n]+?)\k<strong>|(?<emphasis>\*|_)(?<emphasisText>[^\n]+?)\k<emphasis>|\\(?<escaped>[\\\x60*_$\{\}\[\]\(\)#+.!>|~-])/gi;
+const inlineToken = /(?<tick>\x60+)(?<code>.+?)\k<tick>|(?<formula>\uFDD0(?<formulaId>\d+)\uFDD1)|(?<reference>\uE200[a-z][\w-]*\uE202[^\uE200\uE201]*\uE201)|(?<binding>\{\s*(?<variable>[a-z_]\w*)\s*(?:\[\s*(?<column>\d+)\s*\]|(?<increment>\+\s*1))?\s*\})|(?<image>!?)\[(?<label>[^\]\n]+)\]\((?<href>(?:[^()\s]|\([^()\s]*\))+)\)|(?<strong>\*\*|__|~~)(?<strongText>[^\n]+?)\k<strong>|(?<emphasis>\*|_)(?<emphasisText>[^\n]+?)\k<emphasis>|\\(?<escaped>[\\\x60*_$\{\}\[\]\(\)#+.!>|~-])/gi;
+
+function eachValue(part, scope) {
+  if (!scope) return part.binding;
+  if (part.variable === scope.item && !part.increment) {
+    const column = part.column === undefined ? null : Number(part.column);
+    const value = column === null ? scope.row : Array.isArray(scope.row) ? scope.row[column] : undefined;
+    if (value !== undefined && !Array.isArray(value)) return value === null ? "" : String(value);
+  }
+  if (part.variable === scope.index && part.column === undefined) {
+    return String(scope.position + (part.increment ? 1 : 0));
+  }
+  return part.binding;
+}
 
 function mathElement(formula) {
   const element = make("span", undefined, formula.display ? "formula formula-display" : "formula");
@@ -1456,6 +1472,8 @@ function inline(parent, text, view, depth = 0) {
     } else if (part.formula) {
       const formula = view.formulas[Number(part.formulaId)];
       parent.append(formula ? mathElement(formula) : part.formula);
+    } else if (part.binding) {
+      parent.append(eachValue(part, view.each));
     } else if (part.reference) {
       for (const source of view.sources.get(part.reference) || []) {
         const link = externalLink(source.url, source.title || "Fonte");
@@ -1613,7 +1631,54 @@ function renderMarkdown(container, text, view, depth = 0) {
 
 const styledTags = new Set(["writingblock", "box", "caption"]);
 const foreignTags = new Set(["svg", "path", "g", "math", "mrow", "mi", "mo", "mn", "ms", "mtext", "mfrac"]);
-const styledToken = /^ {0,3}(?<fence>\x60{3,}|~{3,})[^\r\n]*|(?<code>\x60+)|(?<math>(?<!\\)(?:\\\(|\\\[|\\begin\{(?:align(?:at)?|aligned|gather|equation|multline|split)\*?\})|(?<![\\$])(?:\$\$|\$(?![\s$])))|\\?(?:<|&lt;)(?<closing>\/?)(?<tag>[a-z][\w-]{0,63})(?=[\s/>]|&gt;)(?<attributes>[^<>\r\n]{0,1024}?)(?:>|&gt;)/gim;
+const styledToken = /^ {0,3}(?<fence>\x60{3,}|~{3,})[^\r\n]*|(?<code>\x60+)|(?<each>(?<!\\)\{#each(?=\s))|(?<math>(?<!\\)(?:\\\(|\\\[|\\begin\{(?:align(?:at)?|aligned|gather|equation|multline|split)\*?\})|(?<![\\$])(?:\$\$|\$(?![\s$])))|\\?(?:<|&lt;)(?<closing>\/?)(?<tag>[a-z][\w-]{0,63})(?=[\s/>]|&gt;)(?<attributes>[^<>\r\n]{0,1024}?)(?:>|&gt;)/gim;
+
+function jsonArrayEnd(text, start) {
+  let quoted = false;
+  let depth = 0;
+  for (let i = start; i < text.length; i += 1) {
+    const char = text[i];
+    if (quoted && char === "\\") i += 1;
+    else if (char === '"') quoted = !quoted;
+    else if (!quoted && char === "[") depth += 1;
+    else if (!quoted && char === "]" && --depth === 0) return i + 1;
+  }
+  return -1;
+}
+
+function readEach(text, opener, start) {
+  const source = text.slice(start, start + 65536);
+  const arrayStart = source.search(/\S/);
+  const arrayEnd = source[arrayStart] === "[" ? jsonArrayEnd(source, arrayStart) : -1;
+  const header = arrayEnd > 0
+    ? /^\s+as\s+([a-z_]\w*)(?:\s*,\s*([a-z_]\w*))?\s*\}/i.exec(source.slice(arrayEnd))
+    : null;
+  const bodyStart = header ? arrayEnd + header[0].length : 0;
+  const close = source.indexOf("{/each}", bodyStart);
+  if (close < 0) return null;
+  const next = start + close + "{/each}".length;
+  const block = {raw: text.slice(opener, next), next};
+  if (!header) return block;
+
+  const [, item, index] = header;
+  const body = source.slice(bodyStart, close).trim();
+  if (!body || item === index || /\{[#:/@]/.test(body)) return block;
+  let rows;
+  try {
+    rows = JSON.parse(source.slice(arrayStart, arrayEnd));
+  } catch {
+    return block;
+  }
+  const scalar = (value) => value === null || typeof value === "string"
+    || typeof value === "boolean" || Number.isFinite(value);
+  const estimatedSize = rows.length * body.length + (arrayEnd - arrayStart) * (body.split("{").length - 1);
+  if (rows.length > 500 || estimatedSize > 1000000
+      || !rows.every((row) => Array.isArray(row) ? row.every(scalar) : scalar(row))) return block;
+
+  const leadingIndex = /^\{\s*([a-z_]\w*)\s*\+\s*1\s*\}[ \t]*(?:\r?\n|$)/i.exec(body);
+  const numbered = Boolean(leadingIndex && leadingIndex[1] === index);
+  return {...block, item, index, rows, numbered, body: numbered ? body.slice(leadingIndex[0].length).trimStart() : body};
+}
 
 function readFormula(text, index, opener) {
   const environment = opener.startsWith("\\begin{");
@@ -1652,6 +1717,13 @@ function* markupTokens(text, formulas) {
       const end = text.indexOf(token.code, scan.lastIndex);
       const lineEnd = text.indexOf("\n", scan.lastIndex);
       if (end >= 0 && (lineEnd < 0 || end < lineEnd)) scan.lastIndex = end + token.code.length;
+    } else if (token.each) {
+      const block = readEach(text, match.index, scan.lastIndex);
+      if (!block) continue;
+      if (offset < match.index) yield text.slice(offset, match.index);
+      yield {each: block};
+      scan.lastIndex = block.next;
+      offset = block.next;
     } else if (token.math) {
       const formula = readFormula(text, scan.lastIndex, token.math);
       if (!formula) continue;
@@ -1797,6 +1869,8 @@ function renderStyled(container, parts, view) {
       renderMarkdown(container, part, view);
     } else if (part.ref) {
       mappedAttachment(container, part.ref, view);
+    } else if (part.each) {
+      renderEach(container, part.each, view);
     } else if (part.tag === "writingblock") {
       writingBlock(container, part, view);
     } else {
@@ -1805,6 +1879,25 @@ function renderStyled(container, parts, view) {
       if (nested.hasChildNodes()) container.append(nested);
     }
   }
+}
+
+function renderEach(container, block, view) {
+  if (!block.rows) {
+    const pre = make("pre");
+    pre.append(make("code", block.raw));
+    container.append(pre);
+    return;
+  }
+  if (!block.rows.length) return;
+  const list = make(block.numbered ? "ol" : "ul", undefined, "each-list");
+  const parts = styledParts([block.body], view);
+  for (const [position, row] of block.rows.entries()) {
+    const entry = make("li");
+    const each = {item: block.item, index: block.index, row, position};
+    renderStyled(entry, parts, {...view, each});
+    list.append(entry);
+  }
+  container.append(list);
 }
 
 function renderSavedText(container, text, view) {

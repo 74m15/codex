@@ -50,6 +50,8 @@ Il clic apre un popup sopra la chat. Immagini, PDF, file di testo e i formati au
 
 Il sito visualizza i costrutti Markdown più comuni, inclusi blocchi di codice, elenchi, citazioni e tabelle semplici. Riconosce `<WritingBlock>`, `<box>` e `<caption>` come elementi di visualizzazione e mostra il contenuto racchiuso in altre coppie di tag personalizzati. Quando disponibile, recupera dai metadati il testo dei blocchi di scrittura e gli URL delle citazioni. I tag negli esempi di codice restano letterali. I blocchi Canvas esportati sono disponibili anche come file Markdown scaricabili.
 
+I blocchi `{#each … as p,i}` con una lista JSON vengono mostrati come elenchi. `{p[0]}` inserisce una cella della riga e `{i+1}` indica la posizione a partire da uno. Il visualizzatore interpreta questi dati come testo. Le espressioni e le direttive che esulano da questo formato restano letterali.
+
 Le formule LaTeX tra `\(...\)`, `\[...\]`, `$...$` e `$$...$$` vengono visualizzate come formule in linea o a blocco. Gli ambienti comuni, come `align`, sono supportati anche fuori dai delimitatori. Il sito include KaTeX 0.19.1 con licenza MIT e può visualizzare formule offline. [Licenza e sorgente KaTeX](https://www.npmjs.com/package/katex/v/0.19.1)
 
 Apri una conversazione e seleziona **Stampa** per stampare o salvare in PDF tutti i messaggi del ramo visualizzato, anche su più pagine.
