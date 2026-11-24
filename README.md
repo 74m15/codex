@@ -48,4 +48,8 @@ Gli allegati disponibili del ramo visibile compaiono nel punto indicato dal `map
 
 Il clic apre un popup sopra la chat. Immagini, PDF, file di testo e i formati audio e video supportati dal browser hanno un’anteprima. Il pulsante **Scarica allegato** è disponibile per tutti i formati. Per applicare un aggiornamento, rigenera il sito dalla cartella dell’export originale.
 
-Il sito visualizza i costrutti Markdown più comuni, inclusi blocchi di codice, elenchi, citazioni e tabelle semplici. Riconosce anche `<WritingBlock>`, `<box>` e `<caption>` come elementi di visualizzazione. Quando l’export include il contenuto nei metadati, il testo del blocco di scrittura viene recuperato da lì. I blocchi Canvas esportati sono disponibili anche come file Markdown scaricabili. I tag negli esempi di codice restano letterali.
+Il sito visualizza i costrutti Markdown più comuni, inclusi blocchi di codice, elenchi, citazioni e tabelle semplici. Riconosce `<WritingBlock>`, `<box>` e `<caption>` come elementi di visualizzazione e mostra il contenuto racchiuso in altre coppie di tag personalizzati. Quando disponibile, recupera dai metadati il testo dei blocchi di scrittura e gli URL delle citazioni. I tag negli esempi di codice restano letterali. I blocchi Canvas esportati sono disponibili anche come file Markdown scaricabili.
+
+Le formule LaTeX tra `\(...\)`, `\[...\]`, `$...$` e `$$...$$` vengono visualizzate come formule in linea o a blocco. Gli ambienti comuni, come `align`, sono supportati anche fuori dai delimitatori. Il sito include KaTeX 0.19.1 con licenza MIT e può visualizzare formule offline. [Licenza e sorgente KaTeX](https://www.npmjs.com/package/katex/v/0.19.1)
+
+Apri una conversazione e seleziona **Stampa** per stampare o salvare in PDF tutti i messaggi del ramo visualizzato, anche su più pagine.
