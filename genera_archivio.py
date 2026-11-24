@@ -1,4 +1,4 @@
-"""Genera un archivio locale degli export di exportChatGPTFullPagination-v5.js."""
+"""Genera un archivio locale degli export di exportChatGPTFullPagination."""
 
 import argparse
 import asyncio
@@ -309,10 +309,13 @@ def add_file_ref(refs, data, identifier, image=False):
     previous = refs.get(key, {})
     title = title or (previous["name"] if previous and not previous.get("generic") else "")
     mime = string(data.get("mime_type") or data.get("mimeType") or previous.get("mime"))
+    if not mime and data.get("content_type") == "audio_asset_pointer" and data.get("format") == "wav":
+        mime = "audio/wav"
     image = image or previous.get("image", False) or mime.startswith("image/")
+    label = "Immagine" if image else "Audio" if data.get("content_type") == "audio_asset_pointer" else "Allegato"
     refs[key] = {
         "key": key, "id": identifier, "source_id": source_id,
-        "name": title or ("Immagine" if image else "Allegato"),
+        "name": title or label,
         "image": image, "generic": not title, "mime": mime,
     }
     return key
@@ -355,26 +358,73 @@ def visible(message):
     )
 
 
-def message_sources(metadata):
+def source_links(entries):
+    links = {}
+    for entry in entries:
+        entry = obj(entry)
+        url = next((url for field in ("url", "content_url", "original_content_url")
+                    if (url := string(entry.get(field))).startswith(("http://", "https://"))), "")
+        if url:
+            links[url] = string(entry.get("title") or entry.get("name")) or links.get(url, "")
+    return [{"url": url, "title": title} for url, title in links.items()]
+
+
+def message_sources(metadata, refs):
     sources = {}
     for value in array(metadata.get("content_references")):
         reference = obj(value)
         marker = string(reference.get("matched_text"))
         if not marker.startswith("\ue200") or not marker.endswith("\ue201"):
             continue
-        links = sources.setdefault(marker, {})
-        for item in [reference, *array(reference.get("items"))]:
-            item = obj(item)
-            url = string(item.get("url"))
-            if url.startswith(("http://", "https://")):
-                links[url] = string(item.get("title") or item.get("name")) or links.get(url, "")
-        for url in array(reference.get("safe_urls")):
-            if string(url).startswith(("http://", "https://")):
-                links.setdefault(url, "")
-    return [
-        {"marker": marker, "links": [{"url": url, "title": title} for url, title in links.items()]}
-        for marker, links in sources.items() if links
-    ]
+        kind = reference.get("type")
+        if kind == "hidden":
+            continue
+        items = [reference, reference.get("item"), *array(reference.get("items"))]
+        items.extend(obj(image).get("image_result") for image in array(reference.get("images")))
+        items.extend({"url": url} for url in array(reference.get("safe_urls")))
+        previous = sources.get(marker, {})
+        links = source_links([*previous.get("links", ()), *items])
+        alt = string(reference.get("alt"))
+        key = ""
+        if kind == "file":
+            asset = next((item for name in ("id", "input_pointer", "library_file_id")
+                          if (item := file_id(reference.get(name), allow_bare=True))), "")
+            if asset:
+                key = add_file_ref(refs, reference, asset)
+            alt = ""
+        data = obj(reference.get("data"))
+        if data.get("widget_type") == "map_widget":
+            places = [
+                " — ".join(filter(None, (string(point.get("name")), string(point.get("address")))))
+                for item in array(data.get("points")) if (point := obj(item))
+            ]
+            alt = " · ".join(filter(None, [string(data.get("answer")), *places]))
+        if links or alt or key:
+            sources[marker] = {
+                "marker": marker, "links": links, "alt": alt or previous.get("alt", ""),
+                "ref": key or previous.get("ref", ""),
+                "show_alt": bool(previous.get("show_alt") or kind in {"forecast", "stock"}
+                                 or data.get("widget_type") == "map_widget"),
+            }
+    return list(sources.values())
+
+
+def embedded_results(generated):
+    components = []
+    for item in obj(generated.get("componentResults")).values():
+        entry = obj(item)
+        name = string(entry.get("componentName")).lower()
+        if name not in {"asyncimage", "asyncimagegroup", "cite", "link", "entity", "filecite"}:
+            continue
+        state = obj(entry.get("state"))
+        images = array(state.get("images"))
+        links = source_links([*images, *array(state.get("items")), state])
+        if links:
+            components.append({
+                "type": name, "links": links,
+                "queries": list(dict.fromkeys(string(obj(image).get("image_search_query")) for image in images)),
+            })
+    return components
 
 
 def prepare_messages(raw, fallback):
@@ -407,6 +457,8 @@ def prepare_messages(raw, fallback):
             if text:
                 text_parts.append(text)
                 parts.append(text)
+            if part.get("content_type") == "real_time_user_audio_video_asset_pointer":
+                part = obj(part.get("audio_asset_pointer"))
             pointer = part.get("asset_pointer") or part.get("file_id")
             if pointer:
                 asset = file_id(pointer, allow_bare=not part.get("asset_pointer"))
@@ -438,8 +490,11 @@ def prepare_messages(raw, fallback):
             path = unquote(match[1])
             refs[path] = {"key": path, "name": path.rsplit("/", 1)[-1]}
         app_data = obj(obj(metadata.get("model_dil_v2")).get("appData"))
-        for component in obj(obj(app_data.get("opGenui")).get("componentResults")).values():
-            path = sandbox_path(obj(obj(component).get("state")).get("url"))
+        generated = obj(app_data.get("opGenui"))
+        for component in obj(generated.get("componentResults")).values():
+            component = obj(component)
+            state = obj(component.get("state"))
+            path = sandbox_path(state.get("url"))
             if path and path not in refs:
                 refs[path] = {"key": path, "name": path.rsplit("/", 1)[-1]}
 
@@ -454,17 +509,31 @@ def prepare_messages(raw, fallback):
             refs[key] = {"key": key, "name": "Canvas.md", "match_name": key, "source_id": canvas_id}
             blocks.append({"id": canvas_id, "title": title, "text": text, "ref": key})
 
+        for reference in array(metadata.get("content_references")):
+            data = obj(obj(reference).get("data"))
+            if data.get("widget_type") == "writing_block" and (text := string(data.get("content"))):
+                block_id = string(data.get("id")) or "writing-block"
+                if not any(block["id"] == block_id for block in blocks):
+                    asset = f"Canvas_{block_id}.md" if re.fullmatch(r"[a-zA-Z0-9_-]+", block_id) else ""
+                    if asset:
+                        refs[asset] = {"key": asset, "name": "Canvas.md", "match_name": asset, "source_id": block_id}
+                    blocks.append({"id": block_id, "title": "", "text": text, "ref": asset})
+        sources = message_sources(metadata, refs)
+        components = embedded_results(generated) if in_path else []
+
         for key, ref in refs.items():
             previous = combined_refs.get(key)
             if previous is None or (previous.get("generic") and not ref.get("generic")):
                 combined_refs[key] = ref
-        if in_path and (body.strip() or refs):
+        if in_path and (body.strip() or refs or blocks or components):
             prepared = {
                 "role": obj(message["author"])["role"],
                 "parts": parts, "refs": list(refs), "blocks": blocks,
             }
-            if sources := message_sources(metadata):
+            if sources:
                 prepared["sources"] = sources
+            if components:
+                prepared["components"] = components
             messages.append(prepared)
     if not messages and not obj(raw.get("mapping")) and fallback.strip():
         messages.append({"role": "transcript", "parts": [fallback], "refs": [], "blocks": []})
@@ -971,7 +1040,7 @@ async def generate(source, destination, terminal):
     entries = await source.entries()
     batches, candidates = scan_names(entries)
     if not batches and not candidates:
-        raise ValueError("Nessun export v5 riconosciuto nella cartella di origine.")
+        raise ValueError("Nessun export riconosciuto nella cartella di origine.")
 
     site_name, site = await create_site_folder(destination)
     terminal.info(f"Destinazione: {site.name}")
@@ -1178,7 +1247,7 @@ HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file:; style-src 'self' file:; img-src 'self' file:; media-src 'self' file:; frame-src 'self' file:; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file:; style-src 'self' file:; img-src 'self' file: data:; media-src 'self' file:; frame-src 'self' file:; base-uri 'none'; form-action 'none'">
   <title>Archivio chat</title>
   <link rel="stylesheet" href="stile.css">
   <script defer src="indice.js"></script>
@@ -1284,6 +1353,7 @@ main { min-height: 0; overflow: auto; }
 .formula { white-space: normal; }
 .formula-display { display: block; overflow: auto; margin: .8em 0; padding: 2px 0; text-align: center; }
 .citation { margin-inline: 2px; font-size: .84em; overflow-wrap: anywhere; }
+.source-summary { white-space: pre-line; }
 .each-list > li + li { margin-top: .55em; }
 .each-list > li > :first-child { margin-top: 0; }
 .each-list > li > :last-child { margin-bottom: 0; }
@@ -1311,6 +1381,9 @@ main { min-height: 0; overflow: auto; }
 .message-writing { background: var(--surface); }
 .prose .writing-title { margin: 0 0 8px; font-weight: 650; }
 .message-caption { margin: 6px 0; color: var(--muted); font-size: .92rem; }
+.message-row { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px 16px; }
+.message-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 8px 16px; }
+.embedded-links { overflow-wrap: anywhere; }
 .attachments { margin-top: 24px; border-top: 1px solid var(--edge); padding-top: 14px; }
 .attachments > summary { font-weight: 650; }
 .attachments summary { cursor: pointer; }
@@ -1446,19 +1519,26 @@ const externalLink = (href, label) => {
   }
 };
 
-const inlineToken = /(?<tick>\x60+)(?<code>.+?)\k<tick>|(?<formula>\uFDD0(?<formulaId>\d+)\uFDD1)|(?<title>\uFDD2(?<titleId>\d+)\uFDD3)|(?<reference>\uE200[a-z][\w-]*\uE202[^\uE200\uE201]*\uE201)|(?<binding>\{\s*(?<variable>[a-z_]\w*)\s*(?:\[\s*(?<column>\d+)\s*\]|(?<increment>\+\s*1))?\s*\})|(?<image>!?)\[(?<label>[^\]\n]+)\]\((?<href>(?:[^()\s]|\([^()\s]*\))+)\)|(?<strong>\*\*|__|~~)(?<strongText>[^\n]+?)\k<strong>|(?<emphasis>\*|_)(?<emphasisText>[^\n]+?)\k<emphasis>|\\(?<escaped>[\\\x60*_$\{\}\[\]\(\)#+.!>|~-])/gi;
+const dataPath = String.raw`[a-z_]\w*(?:\.[a-z_]\w*|\[\s*\d+\s*\])*`;
+const dataPathPattern = new RegExp("^" + dataPath + "$", "i");
+const inlineToken = /(?<tick>\x60+)(?<code>.+?)\k<tick>|(?<formula>\uFDD0(?<formulaId>\d+)\uFDD1)|(?<title>\uFDD2(?<titleId>\d+)\uFDD3)|(?<reference>\uE200[a-z][\w-]*(?:\uE202[^\uE200\uE201]*)?\uE201)|(?<binding>\{\s*(?<path>[a-z_]\w*(?:\.[a-z_]\w*|\[\s*\d+\s*\])*)\s*(?<increment>\+\s*1)?\s*\})|(?<image>!?)\[(?<label>[^\]\n]+)\]\((?<href>(?:[^()\s]|\([^()\s]*\))+)\)|(?<strong>\*\*|__|~~)(?<strongText>[^\n]+?)\k<strong>|(?<emphasis>\*|_)(?<emphasisText>[^\n]+?)\k<emphasis>|\\(?<escaped>[\\\x60*_$\{\}\[\]\(\)#+.!>|~-])/gi;
 
-function eachValue(part, scope) {
-  if (!scope) return part.binding;
-  if (part.variable === scope.item && !part.increment) {
-    const column = part.column === undefined ? null : Number(part.column);
-    const value = column === null ? scope.row : Array.isArray(scope.row) ? scope.row[column] : undefined;
-    if (value !== undefined && !Array.isArray(value)) return value === null ? "" : String(value);
+function dataValue(path, bindings) {
+  if (!dataPathPattern.test(path)) return undefined;
+  const [name, ...keys] = path.match(/[a-z_]\w*|\d+/gi);
+  let value = bindings.get(name);
+  for (const key of keys) {
+    if (!value || typeof value !== "object" || !Object.hasOwn(value, key)
+        || /^(?:__proto__|constructor|prototype)$/.test(key)) return undefined;
+    value = value[key];
   }
-  if (part.variable === scope.index && part.column === undefined) {
-    return String(scope.position + (part.increment ? 1 : 0));
-  }
-  return part.binding;
+  return value;
+}
+
+function bindingText(part, bindings) {
+  const value = dataValue(part.path, bindings);
+  if (part.increment) return Number.isFinite(value) ? String(value + 1) : part.binding;
+  return value === null ? "" : value !== undefined && typeof value !== "object" ? String(value) : part.binding;
 }
 
 function mathElement(formula) {
@@ -1500,13 +1580,19 @@ function inline(parent, text, view, depth = 0) {
         parent.append(part.title);
       }
     } else if (part.binding) {
-      parent.append(eachValue(part, view.each));
+      parent.append(bindingText(part, view.bindings));
     } else if (part.reference) {
-      for (const source of view.sources.get(part.reference) || []) {
-        const link = externalLink(source.url, source.title || "Fonte");
-        if (link) {
-          link.className = "citation";
-          parent.append(link);
+      const source = view.sources.get(part.reference);
+      if (source) {
+        const file = source.ref && Object.hasOwn(view.files, source.ref) ? view.files[source.ref] : null;
+        if (file) {
+          parent.append(fileLink(file, undefined, true));
+          view.shown.add(source.ref);
+        } else {
+          if (source.alt && (source.show_alt || !source.links.length)) {
+            parent.append(make("span", source.alt, "source-summary"));
+          }
+          appendSourceLinks(parent, source.links, view);
         }
       }
     } else if (part.href) {
@@ -1656,9 +1742,10 @@ function renderMarkdown(container, text, view, depth = 0) {
   }
 }
 
-const styledTags = new Set(["writingblock", "box", "caption"]);
+const styledTags = new Set(["writingblock", "box", "caption", "row", "grid", "grid-item", "text", "list", "list-item", "divider", "button", "radio", "radio-group", "pressable"]);
+const embeddedTags = new Set(["asyncimage", "asyncimagegroup", "cite", "link", "entity", "filecite"]);
 const foreignTags = new Set(["svg", "path", "g", "math", "mrow", "mi", "mo", "mn", "ms", "mtext", "mfrac"]);
-const styledToken = /^ {0,3}(?<fence>\x60{3,}|~{3,})[^\r\n]*|(?<code>\x60+)|(?<!\\)\{(?:(?<each>#each)|(?<body>@body)|(?<condition>#if))(?=\s)|(?<math>(?<!\\)(?:\\\(|\\\[|\\begin\{(?:align(?:at)?|aligned|gather|equation|multline|split)\*?\})|(?<![\\$])(?:\$\$|\$(?![\s$])))|\\?(?:<|&lt;)(?<closing>\/?)(?<tag>[a-z][\w-]{0,63})(?=[\s/>]|&gt;)(?<attributes>[^<>\r\n]{0,1024}?)(?:>|&gt;)/gim;
+const styledToken = /^ {0,3}(?<fence>\x60{3,}|~{3,})[^\r\n]*|(?<code>\x60+)|(?<svg>\\?(?:<|&lt;)svg(?=[\s/>]|&gt;))|(?<!\\)\{(?:(?<each>#each)|(?<body>@body)|(?<condition>#if))(?=\s)|(?<math>(?<!\\)(?:\\\(|\\\[|\\begin\{(?:align(?:at)?|aligned|gather|equation|multline|split)\*?\})|(?<![\\$])(?:\$\$|\$(?![\s$])))|\\?(?:<|&lt;)(?<closing>\/?)(?<tag>[a-z][\w-]{0,63})(?=[\s/>]|&gt;)(?<attributes>[^<>\r\n]{0,1024}?)(?:>|&gt;)/gim;
 
 function literalEnd(text, start, left, right) {
   let quote = "";
@@ -1679,41 +1766,110 @@ function literalEnd(text, start, left, right) {
   return -1;
 }
 
+function skipCode(text, token, start) {
+  if (token.fence) {
+    const end = new RegExp("^ {0,3}" + token.fence[0] + "{" + token.fence.length + ",}[ \\t]*\\r?$", "gm");
+    end.lastIndex = start;
+    return end.exec(text) ? end.lastIndex : text.length;
+  }
+  const end = text.indexOf(token.code, start);
+  const lineEnd = text.indexOf("\n", start);
+  return end >= 0 && (lineEnd < 0 || end < lineEnd) ? end + token.code.length : start;
+}
+
+function templateBranches(source, start, kind) {
+  const scan = /^ {0,3}(?<fence>\x60{3,}|~{3,})[^\r\n]*|(?<code>\x60+)|(?<!\\)\{(?:#(?<open>if|each)(?=\s)|\/(?<close>if|each)\s*\}|(?<else>:else)\s*\})/gm;
+  scan.lastIndex = start;
+  const stack = [kind];
+  let alternative = null;
+  let invalid = false;
+  for (let match; (match = scan.exec(source));) {
+    const token = match.groups;
+    if (token.fence || token.code) {
+      scan.lastIndex = skipCode(source, token, scan.lastIndex);
+    } else if (token.open) {
+      stack.push(token.open);
+    } else if (token.else && stack.length === 1) {
+      if (alternative || kind !== "if") invalid = true;
+      else alternative = {left: match.index, right: scan.lastIndex};
+    } else if (token.close) {
+      if (token.close !== stack.at(-1)) return null;
+      stack.pop();
+      if (!stack.length) {
+        return {
+          body: source.slice(start, alternative?.left ?? match.index),
+          otherwise: alternative ? source.slice(alternative.right, match.index) : "",
+          close: scan.lastIndex,
+          invalid,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+const eachHeader = /^\s+as\s+([a-z_]\w*)(?:\s*,\s*([a-z_]\w*))?\s*\}/i;
+const namedEachHeader = new RegExp("^\\s+(" + dataPath + ")" + eachHeader.source.slice(1), "i");
+const rangeEachHeader = new RegExp(
+  "^\\s+Array\\.from\\(\\s*\\{\\s*length\\s*:\\s*(\\d+|" + dataPath
+  + ")\\s*\\}\\s*,\\s*\\(\\s*_,\\s*([a-z_]\\w*)\\s*\\)\\s*=>\\s*\\2\\s*\\)"
+  + eachHeader.source.slice(1), "i"
+);
+const sliceEachHeader = new RegExp("^\\.slice\\(\\s*0\\s*,\\s*(\\d+|" + dataPath + ")\\s*\\)", "i");
+
+function readDataLiteral(source) {
+  // Gli export osservati usano anche chiavi senza virgolette e virgole finali.
+  const text = source.replace(
+    /"(?:[^"\\]|\\.)*"|([,{]\s*)([a-z_]\w*)(?=\s*:)|,(?=\s*[}\]])/gis,
+    (value, prefix, key) => key ? prefix + '"' + key + '"' : value === "," ? "" : value,
+  );
+  try { return JSON.parse(text); }
+  catch { return undefined; }
+}
+
 function readEach(text, opener, start) {
   const source = text.slice(start, start + 65536);
   const arrayStart = source.search(/\S/);
   const arrayEnd = source[arrayStart] === "[" ? literalEnd(source, arrayStart, "[", "]") : -1;
-  const header = arrayEnd > 0
-    ? /^\s+as\s+([a-z_]\w*)(?:\s*,\s*([a-z_]\w*))?\s*\}/i.exec(source.slice(arrayEnd))
-    : null;
-  const bodyStart = header ? arrayEnd + header[0].length : 0;
-  const close = source.indexOf("{/each}", bodyStart);
-  if (close < 0) return null;
-  const next = start + close + "{/each}".length;
+  const tail = arrayEnd > 0 ? source.slice(arrayEnd) : "";
+  const slice = sliceEachHeader.exec(tail);
+  const sliceLength = slice?.[0].length || 0;
+  const header = arrayEnd > 0 ? eachHeader.exec(tail.slice(sliceLength)) : null;
+  const named = header ? null : namedEachHeader.exec(source);
+  const range = header || named ? null : rangeEachHeader.exec(source);
+  const bodyStart = header ? arrayEnd + sliceLength + header[0].length
+    : named?.[0].length ?? range?.[0].length ?? 0;
+  const branches = templateBranches(source, bodyStart, "each");
+  if (!branches) return null;
+  const next = start + branches.close;
   const block = {raw: text.slice(opener, next), next};
-  if (!header) {
-    const quizHint = /^\s+questions\s+as\s+[a-z_]\w*(?:\s*,\s*[a-z_]\w*)?\s*\}/i.test(source);
-    return {...block, quizHint};
-  }
+  if ((!header && !named && !range) || branches.invalid) return block;
 
-  const [, item, index] = header;
-  const body = source.slice(bodyStart, close).trim();
-  if (!body || item === index || /\{[#:/@]/.test(body)) return block;
-  let rows;
-  try {
-    rows = JSON.parse(source.slice(arrayStart, arrayEnd));
-  } catch {
-    return block;
-  }
-  const scalar = (value) => value === null || typeof value === "string"
-    || typeof value === "boolean" || Number.isFinite(value);
-  const estimatedSize = rows.length * body.length + (arrayEnd - arrayStart) * (body.split("{").length - 1);
-  if (rows.length > 500 || estimatedSize > 1000000
-      || !rows.every((row) => Array.isArray(row) ? row.every(scalar) : scalar(row))) return block;
-
+  const [item, index] = header ? header.slice(1) : named ? named.slice(2) : range.slice(3);
+  const body = branches.body.trim();
+  if (!body || item === index || /(?<!\\)\{@html\b/.test(body)) return block;
+  const rows = header ? readDataLiteral(source.slice(arrayStart, arrayEnd)) : undefined;
+  if (header && !Array.isArray(rows)) return block;
   const leadingIndex = /^\{\s*([a-z_]\w*)\s*\+\s*1\s*\}[ \t]*(?:\r?\n|$)/i.exec(body);
   const numbered = Boolean(leadingIndex && leadingIndex[1] === index);
-  return {...block, item, index, rows, numbered, body: numbered ? body.slice(leadingIndex[0].length).trimStart() : body};
+  return {
+    ...block, item, index, rows, collection: named?.[1], range: range?.[1], slice: slice?.[1],
+    quizHint: ["questions", "qs"].includes(named?.[1]), numbered,
+    body: numbered ? body.slice(leadingIndex[0].length).trimStart() : body,
+  };
+}
+
+function readCondition(text, opener) {
+  const source = text.slice(opener, opener + 65536);
+  const header = /^\{#if\s+([^}\r\n]+)\}/.exec(source);
+  if (!header) return null;
+  const branches = templateBranches(source, header[0].length, "if");
+  if (!branches) return null;
+  const expression = header[1].trim();
+  return {
+    ...branches, expression, raw: source.slice(0, branches.close), next: opener + branches.close,
+    quizHint: /^(?:revealed|show|(?:answers|ans)\[\s*i\s*\]\s*===\s*(?:item|q)\.c)$/.test(expression),
+  };
 }
 
 function readTagBody(text, index, tag) {
@@ -1725,77 +1881,258 @@ function readTagBody(text, index, tag) {
 }
 
 const svgNamespace = "http://www.w3.org/2000/svg";
-const svgShapes = new Set(["path", "line", "rect", "circle", "ellipse", "polyline", "polygon", "text"]);
-const svgText = new Set(["text", "tspan", "title", "desc"]);
-const svgContainers = new Set(["svg", "g"]);
-const svgAliases = new Map([
-  ["viewbox", "viewBox"], ["strokeopacity", "stroke-opacity"], ["strokewidth", "stroke-width"],
-  ["fillopacity", "fill-opacity"], ["strokedasharray", "stroke-dasharray"],
-  ["strokelinejoin", "stroke-linejoin"], ["strokelinecap", "stroke-linecap"],
-  ["textanchor", "text-anchor"], ["fontsize", "font-size"],
-]);
-const svgNumbers = new Set([
-  "x", "y", "dx", "dy", "x1", "y1", "x2", "y2", "cx", "cy", "r", "rx", "ry", "width", "height",
-  "opacity", "fill-opacity", "stroke-opacity", "stroke-width", "font-size",
+const svgAliases = new Map(
+  ("alignmentBaseline baselineShift className clipPath clipRule colorInterpolation colorInterpolationFilters "
+    + "dominantBaseline fillOpacity fillRule floodColor floodOpacity fontFamily fontSize fontStyle fontWeight "
+    + "markerEnd markerMid markerStart paintOrder pointerEvents shapeRendering stopColor stopOpacity "
+    + "strokeDasharray strokeDashoffset strokeLinecap strokeLinejoin strokeMiterlimit strokeOpacity strokeWidth "
+    + "textAnchor textDecoration vectorEffect").split(" ").map((name) => [
+      name.toLowerCase(),
+      name === "className" ? "class" : name.replace(/[A-Z]/g, (char) => "-" + char.toLowerCase()),
+    ]),
+);
+const excludedSvgTags = new Set([
+  "script", "foreignobject", "animate", "animatecolor", "animatemotion", "animatetransform", "set", "discard",
 ]);
 
-function validSvgAttribute(name, value) {
-  if (name === "d") return /^[\s,.+\-\deEMmLlHhVvCcSsQqTtAaZz]+$/.test(value);
-  if (["viewBox", "points", "stroke-dasharray"].includes(name)) return /^[\s,.+\-\deE]+$/.test(value);
-  if (name === "stroke" || name === "fill") {
-    return /^(?:#[\da-f]{3,8}|[a-z]+|rgba?\([\d.,% /\s]+\))$/i.test(value);
+function readSvg(text, opener) {
+  const source = text.slice(opener, opener + 262144);
+  const encoded = /^\\?&lt;/.test(source);
+  const tags = encoded
+    ? /&lt;!--[\s\S]*?--&gt;|\\?&lt;(\/?)svg(?=[\s/]|&gt;)([\s\S]*?)&gt;/gi
+    : /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|\\?<(\/?)svg(?=[\s/>])((?:"[^"]*"|'[^']*'|[^"'<>])*)>/gi;
+  let depth = 0;
+  for (const match of source.matchAll(tags)) {
+    if (match[1] === undefined) continue;
+    if (match[1]) depth -= 1;
+    else if (!match[2].trimEnd().endsWith("/")) depth += 1;
+    if (depth === 0) {
+      const end = match.index + match[0].length;
+      return {svg: source.slice(0, end), next: opener + end};
+    }
   }
-  if (svgNumbers.has(name)) {
-    return /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?(?:px|%|em)?$/i.test(value)
-      && Math.abs(parseFloat(value)) <= 100000;
-  }
-  if (name === "stroke-linejoin") return /^(?:miter|round|bevel)$/.test(value);
-  if (name === "stroke-linecap") return /^(?:butt|round|square)$/.test(value);
-  if (name === "text-anchor") return /^(?:start|middle|end)$/.test(value);
-  if (name === "transform") {
-    return /^(?:\s*(?:matrix|translate|scale|rotate|skewX|skewY)\s*\([\d\s.,+\-eE]+\)(?:\s*,)?)+\s*$/.test(value);
-  }
-  return false;
+  return null;
 }
 
-function renderDiagram(raw) {
-  let source = raw.replace(/\\(?=(?:<|&lt;)\/?[a-z])/gi, "");
+function limitValue(source, bindings) {
+  return /^\d+$/.test(source) ? Number(source) : dataValue(source, bindings);
+}
+
+function eachRows(block, bindings) {
+  if (block.range) {
+    const length = limitValue(block.range, bindings);
+    if (!Number.isInteger(length) || length < 0 || length > 500) return undefined;
+    return Array.from({length}, (_, index) => index);
+  }
+  const rows = block.rows ?? (block.collection ? dataValue(block.collection, bindings) : undefined);
+  if (block.slice) {
+    const end = limitValue(block.slice, bindings);
+    return Array.isArray(rows) && Number.isInteger(end) ? rows.slice(0, end) : undefined;
+  }
+  return rows;
+}
+
+function rowBindings(block, bindings, row, index) {
+  const child = new Map(bindings);
+  child.set(block.item, row);
+  if (block.index) child.set(block.index, index);
+  return child;
+}
+
+const graphicOperators = new Map(
+  [["||"], ["&&"], ["===", "!=="], ["<", ">", "<=", ">="], ["+", "-"], ["*", "/", "%"]]
+    .flatMap((group, level) => group.map((operator) => [operator, level + 1])),
+);
+
+function graphicBinary(operator, left, right) {
+  if (left === undefined) return undefined;
+  if (operator === "||") return left || right;
+  if (operator === "&&") return left && right;
+  if (right === undefined) return undefined;
+  if (operator === "===") return left === right;
+  if (operator === "!==") return left !== right;
+  if (operator === "+" && (typeof left === "string" || typeof right === "string")) return String(left) + String(right);
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return undefined;
+  switch (operator) {
+    case "+": return left + right;
+    case "-": return left - right;
+    case "*": return left * right;
+    case "/": return left / right;
+    case "%": return left % right;
+    case "<": return left < right;
+    case ">": return left > right;
+    case "<=": return left <= right;
+    case ">=": return left >= right;
+  }
+}
+
+function graphicValue(expression, bindings) {
+  const input = expression.trim();
+  if (!input || input.length > 240) return undefined;
+  const pattern = new RegExp(
+    "\\s*(Math\\.floor|" + dataPath
+    + '|"(?:[^"\\\\]|\\\\.)*"|\\d+(?:\\.\\d+)?|===|!==|<=|>=|\\|\\||&&|[?:!<>()+*/%\\-])', "gy",
+  );
+  const tokens = [];
+  let offset = 0;
+  while (offset < input.length) {
+    pattern.lastIndex = offset;
+    const token = pattern.exec(input);
+    if (!token) return undefined;
+    tokens.push(token[1]);
+    offset = pattern.lastIndex;
+  }
+  let position = 0;
+  let valid = true;
+  const expect = (token) => {
+    if (tokens[position++] !== token) valid = false;
+  };
+  const factor = () => {
+    const token = tokens[position++];
+    if (token === "+" || token === "-" || token === "!") {
+      const value = factor();
+      if (value === undefined) return undefined;
+      if (token === "!") return !value;
+      return Number.isFinite(value) ? (token === "-" ? -value : value) : undefined;
+    }
+    if (token === "(" || token === "Math.floor") {
+      if (token === "Math.floor") expect("(");
+      const value = parse(0);
+      expect(")");
+      return token === "Math.floor" ? Number.isFinite(value) ? Math.floor(value) : undefined : value;
+    }
+    if (token === undefined) {
+      valid = false;
+      return undefined;
+    }
+    if (/^["\d]/.test(token) || /^(?:true|false|null)$/.test(token)) return readDataLiteral(token);
+    const value = dataValue(token, bindings);
+    return value !== null && typeof value === "object" ? undefined : value;
+  };
+  const parse = (minimum) => {
+    let left = factor();
+    for (let level; (level = graphicOperators.get(tokens[position])) && level >= minimum;) {
+      const operator = tokens[position++];
+      left = graphicBinary(operator, left, parse(level + 1));
+    }
+    if (minimum === 0 && tokens[position] === "?") {
+      position += 1;
+      const yes = parse(0);
+      expect(":");
+      const no = parse(0);
+      return left === undefined ? undefined : left ? yes : no;
+    }
+    return left;
+  };
+  const value = parse(0);
+  if (!valid || position !== tokens.length || (typeof value === "number" && !Number.isFinite(value))) return undefined;
+  return value;
+}
+
+function svgMarkup(source, bindings, budget, depth = 0) {
+  if (depth > 8 || source.length > 262144) return null;
+  const scan = /\{#(each|if)(?=\s)/g;
+  const pieces = [];
+  let offset = 0;
+  let valid = true;
+  const xml = (value) => String(value ?? "").replace(/[&<>"'{}]/g, (char) =>
+    ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;", "{": "&#123;", "}": "&#125;"})[char]);
+  const valueFor = (raw, expression) => {
+    const value = graphicValue(expression, bindings);
+    if (value !== undefined) return xml(value);
+    valid = false;
+    return raw;
+  };
+  const interpolate = (fragment) => fragment
+    .replace(/(=\s*)\{\x60([^\x60]*)\x60\}/g, (_, attribute, template) =>
+      attribute + '"' + template.split(/(\$\{[^{}\r\n]+\})/g).map((item, index) =>
+        index % 2 ? valueFor(item, item.slice(2, -1)) : xml(item)).join("") + '"')
+    .replace(/(=\s*)?\{([^{}\r\n]+)\}/g, (raw, attribute, expression) => {
+      const value = valueFor(raw, expression);
+      return attribute ? attribute + '"' + value + '"' : value;
+    });
+  for (let match; (match = scan.exec(source));) {
+    pieces.push(interpolate(source.slice(offset, match.index)));
+    if (match[1] === "if") {
+      const block = readCondition(source, match.index);
+      const chosen = block && !block.invalid ? graphicValue(block.expression, bindings) : undefined;
+      if (chosen === undefined) return null;
+      const child = svgMarkup(chosen ? block.body : block.otherwise, bindings, budget, depth + 1);
+      if (child === null) return null;
+      pieces.push(child);
+      scan.lastIndex = block.next;
+    } else {
+      const block = readEach(source, match.index, scan.lastIndex);
+      const rows = block && eachRows(block, bindings);
+      if (!Array.isArray(rows) || rows.length > budget.remaining || !block.body) return null;
+      budget.remaining -= rows.length;
+      for (const [index, row] of rows.entries()) {
+        const child = svgMarkup(block.body, rowBindings(block, bindings, row, index), budget, depth + 1);
+        if (child === null) return null;
+        pieces.push(child);
+      }
+      scan.lastIndex = block.next;
+    }
+    offset = scan.lastIndex;
+  }
+  pieces.push(interpolate(source.slice(offset)));
+  const result = pieces.join("");
+  return valid && result.length <= 262144 ? result : null;
+}
+
+function renderDiagram(raw, view) {
+  const rendered = /\{#(?:each|if)|=\s*\{/.test(raw)
+    ? svgMarkup(raw, view.bindings, {remaining: 1500})
+    : raw;
+  if (rendered === null) return null;
+  let source = rendered.replace(/\\(?=(?:<|&lt;)\/?[a-z])/gi, "");
   if (source.startsWith("&lt;")) {
     source = source.replace(/&lt;|&gt;|&quot;/g, (entity) => ({"&lt;": "<", "&gt;": ">", "&quot;": '"'})[entity]);
   }
-  if (source.includes("<!")) return null;
-  const root = new DOMParser().parseFromString(source, "image/svg+xml").documentElement;
-  if (root.localName !== "svg") return null;
+  if (/<!\s*(?:DOCTYPE|ENTITY)\b/i.test(source)) return null;
+  if (!/^<svg[\s>]/.test(source)) return null;
+  // Le risposte generate spesso omettono il namespace, necessario per un'immagine autonoma.
+  if (!/^<svg(?:[^"'<>]|"[^"]*"|'[^']*')*\sxmlns\s*=/.test(source)) {
+    source = source.replace(/^<svg\b/, '<svg xmlns="' + svgNamespace + '"');
+  }
+  const documentSvg = new DOMParser().parseFromString(source, "image/svg+xml");
+  const root = documentSvg.documentElement;
+  if (root.localName !== "svg" || root.namespaceURI !== svgNamespace) return null;
 
-  let shapes = 0;
-  let count = 0;
-  const copy = (node, depth) => {
-    const tag = node.localName;
-    if (depth > 25 || ++count > 1000 || (node.namespaceURI && node.namespaceURI !== svgNamespace)) return null;
-    if (!svgShapes.has(tag) && !svgContainers.has(tag) && !svgText.has(tag)) return null;
-    const safe = document.createElementNS(svgNamespace, tag);
-    for (const attribute of node.attributes) {
-      const name = svgAliases.get(attribute.name.toLowerCase()) || attribute.name.toLowerCase();
-      const value = attribute.value.trim();
-      if (validSvgAttribute(name, value)) safe.setAttribute(name, value);
+  const elements = [root, ...root.querySelectorAll("*")];
+  if (elements.length > 5000) return null;
+  for (const element of elements) {
+    if (element.namespaceURI !== svgNamespace || excludedSvgTags.has(element.localName.toLowerCase())) {
+      element.remove();
+      continue;
     }
-    if (svgShapes.has(tag)) shapes += 1;
-    for (const child of node.childNodes) {
-      if (child.nodeType === Node.ELEMENT_NODE) {
-        const clean = copy(child, depth + 1);
-        if (clean) safe.append(clean);
-      } else if (child.nodeType === Node.TEXT_NODE && svgText.has(tag)) {
-        safe.append(child.nodeValue);
+    for (const attr of [...element.attributes]) {
+      const name = attr.name.toLowerCase();
+      const value = attr.value.trim();
+      const localReference = /^#[^\s"'<>]+$/.test(value);
+      const rasterData = element.localName === "image"
+        && /^data:image\/(?:png|jpeg|webp|avif);base64,[a-z0-9+/=]+$/i.test(value);
+      if (name.startsWith("on") || name === "xml:base" || name === "src"
+          || (attr.localName === "href" && !localReference && !rasterData)
+          || [...value.matchAll(/url\(\s*(['"]?)(.*?)\1\s*\)/gi)].some((match) => !match[2].startsWith("#"))) {
+        element.removeAttributeNode(attr);
+      } else if (svgAliases.has(name)) {
+        const canonical = svgAliases.get(name);
+        element.removeAttributeNode(attr);
+        if (!element.hasAttribute(canonical)) element.setAttribute(canonical, value);
       }
     }
-    return safe;
-  };
-  const svg = copy(root, 0);
-  if (!svg || !shapes) return null;
-  svg.classList.add("output-svg");
-  svg.setAttribute("role", "img");
-  svg.setAttribute("aria-label", svg.querySelector("title")?.textContent.trim() || "Diagramma");
-  return svg;
+  }
+  if (!root.hasAttribute("color")) {
+    const style = documentSvg.createElementNS(svgNamespace, "style");
+    style.textContent = ":root{color:#242236}@media(prefers-color-scheme:dark){:root{color:#f5f1fa}}@media print{:root{color:#17171d}}";
+    root.prepend(style);
+  }
+  // Il browser elabora l'SVG in un documento immagine isolato, con i suoi ID locali.
+  const image = make("img", undefined, "output-svg");
+  image.alt = root.querySelector(":scope > title")?.textContent.trim() || "Diagramma";
+  image.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(new XMLSerializer().serializeToString(root));
+  return image;
 }
 
 function readBodyDirective(text, opener) {
@@ -1804,71 +2141,63 @@ function readBodyDirective(text, opener) {
   if (end < 0) return null;
   const raw = source.slice(0, end);
   const statement = raw.slice("{@body".length, -1).trim();
-  const definition = /^const\s+questions\s*=\s*(\[[\s\S]*\])\s*;?$/.exec(statement);
   const block = {raw, next: opener + end};
-  if (!definition) {
-    const state = /^const\s*\[\s*(?:answers\s*,\s*setAnswers|revealed\s*,\s*setRevealed)\s*\]\s*=\s*DIL\.useState\(\s*(?:\{\s*\}|false)\s*\)\s*;?$/.test(statement);
-    return state ? {...block, quizHint: true} : block;
-  }
 
-  // Riconosce le chiavi del formato esportato senza alterare il contenuto delle stringhe.
-  const json = definition[1].replace(
-    /"(?:[^"\\]|\\.)*"|([,{]\s*)(q|a|c|why)(?=\s*:)|,(?=\s*[}\]])/gs,
-    (value, prefix, key) => key ? prefix + '"' + key + '"' : value === "," ? "" : value,
-  );
-  try {
-    const items = JSON.parse(json);
-    const valid = (item) => item && typeof item.q === "string" && item.q.trim()
-      && Array.isArray(item.a) && item.a.length >= 2 && item.a.length <= 12
-      && item.a.every((answer) => typeof answer === "string")
-      && Number.isInteger(item.c) && item.c >= 0 && item.c < item.a.length
-      && (item.why === undefined || typeof item.why === "string");
-    if (items.length && items.length <= 100 && items.every(valid)) {
-      return {...block, quiz: items.map(({q, a, c, why}) => ({q, a, c, why}))};
-    }
-  } catch {
-    // Le direttive fuori dal formato supportato si conservano come codice.
-  }
-  return block;
-}
-
-function readQuizCondition(text, opener) {
-  const source = text.slice(opener, opener + 65536);
-  if (!/^\{#if\s+(?:revealed|answers\[\s*i\s*\]\s*===\s*item\.c)\s*\}/.test(source)) return null;
-  let depth = 0;
-  for (const match of source.matchAll(/\{#if(?=\s)|\{\/if\s*\}/g)) {
-    if (match[0] === "{#if") depth += 1;
-    else if (--depth === 0) {
-      const end = match.index + match[0].length;
-      return {raw: source.slice(0, end), next: opener + end, quizHint: true};
+  const state = /^const\s*\[\s*([a-z_]\w*)\s*,\s*[a-z_]\w*\s*\]\s*=\s*DIL\.useState\(([\s\S]*)\)\s*;?$/i.exec(statement);
+  if (state) {
+    const initial = readDataLiteral(state[2]);
+    if (initial !== undefined) {
+      const quizHint = ["answers", "ans", "revealed", "show"].includes(state[1]);
+      return {...block, binding: [state[1], initial], quizHint};
     }
   }
-  return null;
+  const definition = /^const\s+(questions|qs)\s*=\s*(\[[\s\S]*\])\s*;?$/.exec(statement);
+  if (!definition) return block;
+  const items = readDataLiteral(definition[2]);
+  if (!Array.isArray(items) || !items.length || items.length > 100) return block;
+  const quiz = items.map((item) => item && ({q: item.q, a: item.a ?? item.opts, c: item.c, why: item.why}));
+  const valid = (item) => item && typeof item.q === "string" && item.q.trim()
+    && Array.isArray(item.a) && item.a.length >= 2 && item.a.length <= 12
+    && item.a.every((answer) => typeof answer === "string")
+    && Number.isInteger(item.c) && item.c >= 0 && item.c < item.a.length
+    && (item.why === undefined || typeof item.why === "string");
+  return quiz.every(valid) ? {...block, quiz} : block;
 }
 
 function isQuizScore(text) {
-  return /^\{questions\.filter\(\((\w+),(\w+)\)=>answers\[\2\]===\1\.c\)\.length\}\/\{questions\.length\}$/.test(text.replace(/\s+/g, ""));
+  return /^\{(questions|qs)\.filter\(\((\w+),(\w+)\)=>(?:answers|ans)\[\3\]===\2\.c\)\.length\}\/\{\1\.length\}$/.test(text.replace(/\s+/g, ""));
 }
 
 function readComponent(text, match, start) {
   const token = match.groups;
   const opener = match.index;
+  if (token.svg) return readSvg(text, opener);
   if (token.each) {
     const block = readEach(text, opener, start);
     if (!block) return null;
-    return block.quizHint ? block : {each: block, next: block.next};
+    return {each: block, next: block.next, quizHint: block.quizHint};
   }
   if (token.body) {
     const block = readBodyDirective(text, opener);
     if (!block) return null;
-    return block.quiz || block.quizHint ? block : {...block, widgetCode: true};
+    return block.quiz || block.binding ? block : {...block, widgetCode: true};
   }
-  if (token.condition) return readQuizCondition(text, opener);
+  if (token.condition) {
+    const condition = readCondition(text, opener);
+    return condition && {condition, next: condition.next, quizHint: condition.quizHint};
+  }
   const tag = token.tag?.toLowerCase();
-  if (token.closing || (tag !== "svg" && tag !== "title")) return null;
+  if (token.closing) return null;
+  if (embeddedTags.has(tag) && token.attributes.trimEnd().endsWith("/")) {
+    const attributes = blockAttributes(token.attributes);
+    return {
+      embedded: {type: tag, query: attributes.get("query"), url: attributes.get("url"), title: attributes.get("title")},
+      next: start,
+    };
+  }
+  if (tag !== "title") return null;
   const content = readTagBody(text, start, tag);
   if (!content) return null;
-  if (tag === "svg") return {svg: text.slice(opener, content.next), next: content.next};
   const attributes = blockAttributes(token.attributes);
   return {
     title: {text: content.text, size: attributes.get("size"), tabular: /\btabularNums\b/i.test(token.attributes)},
@@ -1905,14 +2234,8 @@ function* markupTokens(text, formulas) {
   let offset = 0;
   for (let match; (match = scan.exec(text));) {
     const token = match.groups;
-    if (token.fence) {
-      const end = new RegExp("^ {0,3}" + token.fence[0] + "{" + token.fence.length + ",}[ \\t]*\\r?$", "gm");
-      end.lastIndex = scan.lastIndex;
-      scan.lastIndex = end.exec(text) ? end.lastIndex : text.length;
-    } else if (token.code) {
-      const end = text.indexOf(token.code, scan.lastIndex);
-      const lineEnd = text.indexOf("\n", scan.lastIndex);
-      if (end >= 0 && (lineEnd < 0 || end < lineEnd)) scan.lastIndex = end + token.code.length;
+    if (token.fence || token.code) {
+      scan.lastIndex = skipCode(text, token, scan.lastIndex);
     } else if (token.math) {
       const formula = readFormula(text, scan.lastIndex, token.math);
       if (!formula) continue;
@@ -1957,12 +2280,16 @@ function styledParts(parts, view) {
   }
   flush();
   const hasQuiz = tokens.some((token) => token.quiz);
+  for (const token of tokens) {
+    if (token.binding && !(token.quizHint && hasQuiz)) view.bindings.set(...token.binding);
+  }
   const root = {children: []};
   const stack = [root];
   const append = (token) => {
     const parent = stack.at(-1);
-    if (token.quizHint) {
-      if (!hasQuiz) parent.children.push({...token, widgetCode: true});
+    if (token.binding || (token.quizHint && hasQuiz)) return;
+    if (token.quizHint && !token.each && !token.condition) {
+      parent.children.push({...token, widgetCode: true});
     } else if (token.title) {
       if (!hasQuiz || !isQuizScore(token.title.text)) {
         parent.children.push("\uFDD2" + (view.titles.push(token.title) - 1) + "\uFDD3");
@@ -2077,8 +2404,12 @@ function renderStyled(container, parts, view) {
       mappedAttachment(container, part.ref, view);
     } else if (part.each) {
       renderEach(container, part.each, view);
+    } else if (part.condition) {
+      renderCondition(container, part.condition, view);
+    } else if (part.embedded) {
+      renderEmbedded(container, part.embedded, view);
     } else if (part.svg) {
-      container.append(renderDiagram(part.svg) || literalBlock(part.svg));
+      container.append(renderDiagram(part.svg, view) || literalBlock(part.svg));
     } else if (part.quiz) {
       container.append(renderQuiz(part.quiz));
     } else if (part.widgetCode) {
@@ -2086,9 +2417,10 @@ function renderStyled(container, parts, view) {
     } else if (part.tag === "writingblock") {
       writingBlock(container, part, view);
     } else {
-      const nested = make("div", undefined, "message-" + part.tag);
+      const element = part.tag === "divider" ? "hr" : part.tag === "list" ? "ul" : part.tag === "list-item" ? "li" : "div";
+      const nested = make(element, undefined, "message-" + part.tag);
       renderStyled(nested, part.children, view);
-      if (nested.hasChildNodes()) container.append(nested);
+      if (element === "hr" || nested.hasChildNodes()) container.append(nested);
     }
   }
 }
@@ -2149,18 +2481,75 @@ function renderQuiz(questions) {
   return form;
 }
 
-function renderEach(container, block, view) {
-  if (!block.rows) {
+function appendSourceLinks(container, links, view, deduplicate = false) {
+  for (const source of links) {
+    if (deduplicate && view.shownUrls.has(source.url)) continue;
+    const link = externalLink(source.url, source.title || "Fonte");
+    if (link) {
+      link.className = "citation";
+      view.shownUrls.add(source.url);
+      container.append(link);
+    }
+  }
+}
+
+function renderEmbedded(container, part, view) {
+  const candidates = view.components.filter((entry) => entry.type === part.type && !view.shownComponents.has(entry));
+  const component = (part.query && candidates.find((entry) => entry.queries.includes(part.query))) || candidates[0];
+  const line = make("p", undefined, "embedded-links");
+  if (component) {
+    view.shownComponents.add(component);
+    appendSourceLinks(line, component.links, view, true);
+  } else if (part.url) {
+    appendSourceLinks(line, [{url: part.url, title: part.title}], view, true);
+  }
+  if (line.hasChildNodes()) container.append(line);
+}
+
+const equalityTest = new RegExp("^(" + dataPath + ")\\s*(===|!==)\\s*(.+)$", "i");
+
+function conditionValue(expression, bindings) {
+  const comparison = equalityTest.exec(expression);
+  if (comparison) {
+    const left = dataValue(comparison[1], bindings);
+    let right;
+    try { right = JSON.parse(comparison[3]); }
+    catch { right = dataValue(comparison[3], bindings); }
+    if (left === undefined || right === undefined || (left && typeof left === "object")
+        || (right && typeof right === "object")) return undefined;
+    return comparison[2] === "===" ? left === right : left !== right;
+  }
+  const inverse = expression.startsWith("!");
+  const path = inverse ? expression.slice(1).trim() : expression;
+  const value = path === "true" || path === "false" ? path === "true" : dataValue(path, bindings);
+  return value === undefined ? undefined : inverse ? !value : Boolean(value);
+}
+
+function renderCondition(container, block, view) {
+  const matched = block.invalid ? undefined : conditionValue(block.expression, view.bindings);
+  if (matched === undefined || view.depth >= 12) {
     container.append(literalBlock(block.raw));
     return;
   }
-  if (!block.rows.length) return;
+  const chosen = matched ? block.body : block.otherwise;
+  renderStyled(container, styledParts([chosen], view), {...view, depth: view.depth + 1});
+}
+
+function renderEach(container, block, view) {
+  const rows = eachRows(block, view.bindings);
+  if (!Array.isArray(rows) || rows.length > 500 || rows.length > view.repeatBudget.remaining || view.depth >= 12
+      || rows.length * block.body.length + JSON.stringify(rows).length * (block.body.split("{").length - 1) > 1000000) {
+    container.append(literalBlock(block.raw));
+    return;
+  }
+  if (!rows.length) return;
+  view.repeatBudget.remaining -= rows.length;
   const list = make(block.numbered ? "ol" : "ul", undefined, "each-list");
   const parts = styledParts([block.body], view);
-  for (const [position, row] of block.rows.entries()) {
+  for (const [position, row] of rows.entries()) {
     const entry = make("li");
-    const each = {item: block.item, index: block.index, row, position};
-    renderStyled(entry, parts, {...view, each});
+    const bindings = rowBindings(block, view.bindings, row, position);
+    renderStyled(entry, parts, {...view, bindings, depth: view.depth + 1});
     list.append(entry);
   }
   container.append(list);
@@ -2175,7 +2564,9 @@ function renderMessage(container, message, files, refs) {
     files, refs, shown: new Set(), usedBlocks: new Set(),
     blocks: new Map(message.blocks.map((block) => [block.id, block])),
     formulas: [], titles: [],
-    sources: new Map((message.sources || []).map(({marker, links}) => [marker, links])),
+    bindings: new Map(), depth: 0, repeatBudget: {remaining: 10000},
+    sources: new Map((message.sources || []).map((source) => [source.marker, source])),
+    components: message.components || [], shownComponents: new Set(), shownUrls: new Set(),
   };
   renderStyled(container, styledParts(message.parts, view), view);
   const rawText = message.parts.filter((part) => typeof part === "string").join("\n");
@@ -2192,6 +2583,9 @@ function renderMessage(container, message, files, refs) {
   }
   for (const key of message.refs) {
     if (!view.shown.has(key)) mappedAttachment(container, key, view);
+  }
+  for (const component of view.components) {
+    if (!view.shownComponents.has(component)) renderEmbedded(container, component, view);
   }
 }
 

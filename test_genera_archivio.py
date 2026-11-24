@@ -9,6 +9,34 @@ from genera_archivio import genera_da_cartelle, prepare_messages
 
 
 class AttachmentTests(unittest.TestCase):
+    def test_normalizza_audio_annidato_e_riferimenti_dei_componenti(self):
+        marker = "\ue200filecite\ue202turn0file1\ue201"
+        raw = {"current_node": "one", "mapping": {"one": {"message": {
+            "author": {"role": "user"},
+            "content": {"parts": [
+                {"content_type": "real_time_user_audio_video_asset_pointer", "audio_asset_pointer": {
+                    "content_type": "audio_asset_pointer", "asset_pointer": "sediment://file-voce",
+                    "format": "wav",
+                }},
+                {"content_type": "audio_transcription", "text": "Trascrizione"},
+            ]},
+            "metadata": {
+                "content_references": [
+                    {"type": "file", "matched_text": marker, "id": "file-documento", "name": "Documento.pdf"},
+                    {"type": "video", "matched_text": "\ue200video\ue202ref\ue201", "url": "https://example.test/video"},
+                ],
+                "model_dil_v2": {"appData": {"opGenui": {"componentResults": {"one": {
+                    "componentName": "AsyncImage",
+                    "state": {"images": [{"url": "https://example.test/immagine", "image_search_query": "foto"}]},
+                }}}}},
+            },
+        }}}}
+        messages, refs = prepare_messages(raw, "")
+        self.assertEqual(messages[0]["parts"], [{"ref": "file_voce"}, "Trascrizione"])
+        self.assertEqual(refs["file_voce"]["mime"], "audio/wav")
+        self.assertEqual(messages[0]["sources"][0]["ref"], "file_documento")
+        self.assertEqual(messages[0]["components"][0]["links"][0]["url"], "https://example.test/immagine")
+
     def test_conserva_la_posizione_dei_file_e_i_metadati_del_blocco(self):
         raw = {"current_node": "msg", "mapping": {"msg": {"message": {
             "author": {"role": "assistant"},

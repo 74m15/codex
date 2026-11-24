@@ -2,13 +2,13 @@
 
 [Scarica il pacchetto ZIP](https://raw.githubusercontent.com/74m15/codex/main/archivio_chat_pyodide.zip) oppure apri [lo script Python](genera_archivio.py).
 
-`genera_archivio.py` legge gli export v5 e v6 e genera un sito statico. Usa la libreria standard di Python 3.14 e `asyncio` in un solo thread. I messaggi di avanzamento usano sequenze di colore ANSI compatibili con VT100.
+`genera_archivio.py` legge gli export dalla v5 alla v7 e genera un sito statico. Usa la libreria standard di Python 3.14 e `asyncio` in un solo thread. I messaggi di avanzamento usano sequenze di colore ANSI compatibili con VT100.
 
 ## Esportazione delle chat
 
-Apri il workspace ChatGPT da esportare, esegui [`exportChatGPTFullPagination-v6.js`](exportChatGPTFullPagination-v6.js) nella console del browser e scegli una cartella vuota. Usa quella cartella come origine per `genera_archivio.py`.
+Apri il workspace ChatGPT da esportare, esegui [`exportChatGPTFullPagination-v7.js`](exportChatGPTFullPagination-v7.js) nella console del browser e scegli una cartella vuota. Usa quella cartella come origine per `genera_archivio.py`.
 
-La v6 salva gli allegati con un nome come `0001_Titolo_file-abc123_Bilancio.pdf`. Il nome contiene l’ID completo e l’estensione, così il generatore può collegare anche allegati con lo stesso nome originale. I riferimenti scaduti o non disponibili vengono segnalati nella console.
+Lo script salva gli allegati con un nome come `0001_Titolo_file-abc123_Bilancio.pdf`. Il nome contiene l’ID completo e l’estensione, così il generatore può collegare anche allegati con lo stesso nome originale. La v7 cerca anche gli audio annidati e i file citati nei metadati e salva come Markdown i blocchi Canvas inclusi nei riferimenti. I download scaduti o non disponibili vengono segnalati nella console.
 
 ## Con un worker Pyodide esistente
 
@@ -50,9 +50,12 @@ Il clic apre un popup sopra la chat. Immagini, PDF, file di testo e i formati au
 
 Il sito visualizza i costrutti Markdown più comuni, inclusi blocchi di codice, elenchi, citazioni e tabelle semplici. Riconosce `<WritingBlock>`, `<box>` e `<caption>` come elementi di visualizzazione e mostra il contenuto racchiuso in altre coppie di tag personalizzati. Quando disponibile, recupera dai metadati il testo dei blocchi di scrittura e gli URL delle citazioni. I tag negli esempi di codice restano letterali. I blocchi Canvas esportati sono disponibili anche come file Markdown scaricabili.
 
-I blocchi `{#each … as p,i}` con una lista JSON vengono mostrati come elenchi. `{p[0]}` inserisce una cella della riga e `{i+1}` indica la posizione a partire da uno. Il visualizzatore interpreta questi dati come testo. Le espressioni e le direttive che esulano da questo formato restano letterali.
+## Oggetti incorporati rilevati negli export di test
 
-Gli SVG con forme e testo vengono ricostruiti con elementi e attributi grafici selezionati. I tag di presentazione come `<title size="lg">` formattano il testo nel messaggio. Quando una direttiva `{@body}` contiene un elenco di domande con opzioni, indice della risposta ed eventuale spiegazione, il sito ricrea un quiz con il pulsante **Verifica risposte**. Il quiz parte senza risposte e funziona offline. Il codice racchiuso tra backtick o in un blocco recintato resta letterale.
+- I diagrammi SVG sono mostrati come immagini isolate. Il visualizzatore risolve i cicli, le condizioni e le coordinate calcolate a partire dai dati letterali del messaggio. I riferimenti interni per riempimenti, ritaglio e riuso di forme funzionano nell’immagine. [SVG 2](https://www.w3.org/TR/SVG/latest/conform.html)
+- I blocchi `{#each … as p,i}` con una lista di dati sono mostrati come elenchi. `{p[0]}` inserisce una cella della riga e `{i+1}` indica la posizione a partire da uno. I componenti di presentazione danno struttura al contenuto. Il codice negli esempi e i costrutti non riconosciuti restano leggibili come sorgente.
+- Quando `{@body}` contiene domande con opzioni, indice della risposta ed eventuale spiegazione, il sito ricrea un quiz con il pulsante **Verifica risposte**. Il quiz parte senza risposte e funziona offline.
+- Le trascrizioni vocali sono mostrate nel messaggio. L’audio e i file citati si aprono nel popup quando il relativo file è presente nella cartella di origine. I risultati di immagini e citazioni con URL salvati compaiono come link. Per mappe, meteo e quotazioni si mostra il riepilogo registrato nell’export, quando disponibile.
 
 Le formule LaTeX tra `\(...\)`, `\[...\]`, `$...$` e `$$...$$` vengono visualizzate come formule in linea o a blocco. Gli ambienti comuni, come `align`, sono supportati anche fuori dai delimitatori. Il sito include KaTeX 0.19.1 con licenza MIT e può visualizzare formule offline. [Licenza e sorgente KaTeX](https://www.npmjs.com/package/katex/v/0.19.1)
 
