@@ -52,6 +52,8 @@ Il sito visualizza i costrutti Markdown più comuni, inclusi blocchi di codice, 
 
 I blocchi `{#each … as p,i}` con una lista JSON vengono mostrati come elenchi. `{p[0]}` inserisce una cella della riga e `{i+1}` indica la posizione a partire da uno. Il visualizzatore interpreta questi dati come testo. Le espressioni e le direttive che esulano da questo formato restano letterali.
 
+Gli SVG con forme e testo vengono ricostruiti con elementi e attributi grafici selezionati. I tag di presentazione come `<title size="lg">` formattano il testo nel messaggio. Quando una direttiva `{@body}` contiene un elenco di domande con opzioni, indice della risposta ed eventuale spiegazione, il sito ricrea un quiz con il pulsante **Verifica risposte**. Il quiz parte senza risposte e funziona offline. Il codice racchiuso tra backtick o in un blocco recintato resta letterale.
+
 Le formule LaTeX tra `\(...\)`, `\[...\]`, `$...$` e `$$...$$` vengono visualizzate come formule in linea o a blocco. Gli ambienti comuni, come `align`, sono supportati anche fuori dai delimitatori. Il sito include KaTeX 0.19.1 con licenza MIT e può visualizzare formule offline. [Licenza e sorgente KaTeX](https://www.npmjs.com/package/katex/v/0.19.1)
 
 Apri una conversazione e seleziona **Stampa** per stampare o salvare in PDF tutti i messaggi del ramo visualizzato, anche su più pagine.

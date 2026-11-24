@@ -1287,6 +1287,19 @@ main { min-height: 0; overflow: auto; }
 .each-list > li + li { margin-top: .55em; }
 .each-list > li > :first-child { margin-top: 0; }
 .each-list > li > :last-child { margin-bottom: 0; }
+.output-title { font-weight: 700; }
+.output-title-lg { font-size: 1.23em; }
+.output-title-xl { font-size: 1.45em; }
+.output-title-tabular { font-variant-numeric: tabular-nums; }
+.output-svg { display: block; max-width: 100%; max-height: 75vh; margin: .75em auto; }
+.archive-quiz { margin: 1em 0; }
+.quiz-question { min-width: 0; margin: .8em 0; padding: 8px 12px; border: 1px solid var(--edge); border-radius: 7px; }
+.quiz-question legend { font-weight: 650; padding: 0 4px; }
+.quiz-option { display: flex; align-items: baseline; gap: 7px; padding: 3px 0; cursor: pointer; }
+.quiz-option input { accent-color: var(--accent); }
+.quiz-feedback { color: var(--muted); }
+.quiz-check { padding: 5px 10px; border: 1px solid var(--edge); border-radius: 6px; background: var(--surface); color: var(--ink); }
+.quiz-score { font-weight: 650; }
 .prose table { border-collapse: collapse; width: 100%; background: var(--surface); }
 .prose th, .prose td { border: 1px solid var(--edge); text-align: left; padding: 7px 10px; }
 .table-scroll { margin: 1em 0; overflow: auto; }
@@ -1347,6 +1360,9 @@ main { min-height: 0; overflow: auto; }
   .prose code { background: #f3f3f3; }
   .message-image { max-height: 190mm; object-fit: contain; }
   .mapped-image, .formula-display, .attachment-list li { break-inside: avoid; }
+  .output-svg, .quiz-question { break-inside: avoid; }
+  .output-svg { max-height: 180mm; }
+  .quiz-check { display: none; }
   .attachments:not(:has(.attachment-list)) { display: none; }
 }
 """
@@ -1430,7 +1446,7 @@ const externalLink = (href, label) => {
   }
 };
 
-const inlineToken = /(?<tick>\x60+)(?<code>.+?)\k<tick>|(?<formula>\uFDD0(?<formulaId>\d+)\uFDD1)|(?<reference>\uE200[a-z][\w-]*\uE202[^\uE200\uE201]*\uE201)|(?<binding>\{\s*(?<variable>[a-z_]\w*)\s*(?:\[\s*(?<column>\d+)\s*\]|(?<increment>\+\s*1))?\s*\})|(?<image>!?)\[(?<label>[^\]\n]+)\]\((?<href>(?:[^()\s]|\([^()\s]*\))+)\)|(?<strong>\*\*|__|~~)(?<strongText>[^\n]+?)\k<strong>|(?<emphasis>\*|_)(?<emphasisText>[^\n]+?)\k<emphasis>|\\(?<escaped>[\\\x60*_$\{\}\[\]\(\)#+.!>|~-])/gi;
+const inlineToken = /(?<tick>\x60+)(?<code>.+?)\k<tick>|(?<formula>\uFDD0(?<formulaId>\d+)\uFDD1)|(?<title>\uFDD2(?<titleId>\d+)\uFDD3)|(?<reference>\uE200[a-z][\w-]*\uE202[^\uE200\uE201]*\uE201)|(?<binding>\{\s*(?<variable>[a-z_]\w*)\s*(?:\[\s*(?<column>\d+)\s*\]|(?<increment>\+\s*1))?\s*\})|(?<image>!?)\[(?<label>[^\]\n]+)\]\((?<href>(?:[^()\s]|\([^()\s]*\))+)\)|(?<strong>\*\*|__|~~)(?<strongText>[^\n]+?)\k<strong>|(?<emphasis>\*|_)(?<emphasisText>[^\n]+?)\k<emphasis>|\\(?<escaped>[\\\x60*_$\{\}\[\]\(\)#+.!>|~-])/gi;
 
 function eachValue(part, scope) {
   if (!scope) return part.binding;
@@ -1472,6 +1488,17 @@ function inline(parent, text, view, depth = 0) {
     } else if (part.formula) {
       const formula = view.formulas[Number(part.formulaId)];
       parent.append(formula ? mathElement(formula) : part.formula);
+    } else if (part.title) {
+      const title = view.titles[Number(part.titleId)];
+      if (title) {
+        const node = make("span", undefined, "output-title");
+        if (title.size === "lg" || title.size === "xl") node.classList.add("output-title-" + title.size);
+        if (title.tabular) node.classList.add("output-title-tabular");
+        inline(node, title.text, view, depth + 1);
+        parent.append(node);
+      } else {
+        parent.append(part.title);
+      }
     } else if (part.binding) {
       parent.append(eachValue(part, view.each));
     } else if (part.reference) {
@@ -1631,17 +1658,23 @@ function renderMarkdown(container, text, view, depth = 0) {
 
 const styledTags = new Set(["writingblock", "box", "caption"]);
 const foreignTags = new Set(["svg", "path", "g", "math", "mrow", "mi", "mo", "mn", "ms", "mtext", "mfrac"]);
-const styledToken = /^ {0,3}(?<fence>\x60{3,}|~{3,})[^\r\n]*|(?<code>\x60+)|(?<each>(?<!\\)\{#each(?=\s))|(?<math>(?<!\\)(?:\\\(|\\\[|\\begin\{(?:align(?:at)?|aligned|gather|equation|multline|split)\*?\})|(?<![\\$])(?:\$\$|\$(?![\s$])))|\\?(?:<|&lt;)(?<closing>\/?)(?<tag>[a-z][\w-]{0,63})(?=[\s/>]|&gt;)(?<attributes>[^<>\r\n]{0,1024}?)(?:>|&gt;)/gim;
+const styledToken = /^ {0,3}(?<fence>\x60{3,}|~{3,})[^\r\n]*|(?<code>\x60+)|(?<!\\)\{(?:(?<each>#each)|(?<body>@body)|(?<condition>#if))(?=\s)|(?<math>(?<!\\)(?:\\\(|\\\[|\\begin\{(?:align(?:at)?|aligned|gather|equation|multline|split)\*?\})|(?<![\\$])(?:\$\$|\$(?![\s$])))|\\?(?:<|&lt;)(?<closing>\/?)(?<tag>[a-z][\w-]{0,63})(?=[\s/>]|&gt;)(?<attributes>[^<>\r\n]{0,1024}?)(?:>|&gt;)/gim;
 
-function jsonArrayEnd(text, start) {
-  let quoted = false;
+function literalEnd(text, start, left, right) {
+  let quote = "";
   let depth = 0;
   for (let i = start; i < text.length; i += 1) {
     const char = text[i];
-    if (quoted && char === "\\") i += 1;
-    else if (char === '"') quoted = !quoted;
-    else if (!quoted && char === "[") depth += 1;
-    else if (!quoted && char === "]" && --depth === 0) return i + 1;
+    if (quote) {
+      if (char === "\\") i += 1;
+      else if (char === quote) quote = "";
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === left) {
+      depth += 1;
+    } else if (char === right && --depth === 0) {
+      return i + 1;
+    }
   }
   return -1;
 }
@@ -1649,7 +1682,7 @@ function jsonArrayEnd(text, start) {
 function readEach(text, opener, start) {
   const source = text.slice(start, start + 65536);
   const arrayStart = source.search(/\S/);
-  const arrayEnd = source[arrayStart] === "[" ? jsonArrayEnd(source, arrayStart) : -1;
+  const arrayEnd = source[arrayStart] === "[" ? literalEnd(source, arrayStart, "[", "]") : -1;
   const header = arrayEnd > 0
     ? /^\s+as\s+([a-z_]\w*)(?:\s*,\s*([a-z_]\w*))?\s*\}/i.exec(source.slice(arrayEnd))
     : null;
@@ -1658,7 +1691,10 @@ function readEach(text, opener, start) {
   if (close < 0) return null;
   const next = start + close + "{/each}".length;
   const block = {raw: text.slice(opener, next), next};
-  if (!header) return block;
+  if (!header) {
+    const quizHint = /^\s+questions\s+as\s+[a-z_]\w*(?:\s*,\s*[a-z_]\w*)?\s*\}/i.test(source);
+    return {...block, quizHint};
+  }
 
   const [, item, index] = header;
   const body = source.slice(bodyStart, close).trim();
@@ -1678,6 +1714,166 @@ function readEach(text, opener, start) {
   const leadingIndex = /^\{\s*([a-z_]\w*)\s*\+\s*1\s*\}[ \t]*(?:\r?\n|$)/i.exec(body);
   const numbered = Boolean(leadingIndex && leadingIndex[1] === index);
   return {...block, item, index, rows, numbered, body: numbered ? body.slice(leadingIndex[0].length).trimStart() : body};
+}
+
+function readTagBody(text, index, tag) {
+  const close = new RegExp("\\\\?(?:<|&lt;)\\/" + tag + "\\s*(?:>|&gt;)", "i");
+  const match = close.exec(text.slice(index, index + 65536));
+  if (!match) return null;
+  const end = index + match.index;
+  return {text: text.slice(index, end), next: end + match[0].length};
+}
+
+const svgNamespace = "http://www.w3.org/2000/svg";
+const svgShapes = new Set(["path", "line", "rect", "circle", "ellipse", "polyline", "polygon", "text"]);
+const svgText = new Set(["text", "tspan", "title", "desc"]);
+const svgContainers = new Set(["svg", "g"]);
+const svgAliases = new Map([
+  ["viewbox", "viewBox"], ["strokeopacity", "stroke-opacity"], ["strokewidth", "stroke-width"],
+  ["fillopacity", "fill-opacity"], ["strokedasharray", "stroke-dasharray"],
+  ["strokelinejoin", "stroke-linejoin"], ["strokelinecap", "stroke-linecap"],
+  ["textanchor", "text-anchor"], ["fontsize", "font-size"],
+]);
+const svgNumbers = new Set([
+  "x", "y", "dx", "dy", "x1", "y1", "x2", "y2", "cx", "cy", "r", "rx", "ry", "width", "height",
+  "opacity", "fill-opacity", "stroke-opacity", "stroke-width", "font-size",
+]);
+
+function validSvgAttribute(name, value) {
+  if (name === "d") return /^[\s,.+\-\deEMmLlHhVvCcSsQqTtAaZz]+$/.test(value);
+  if (["viewBox", "points", "stroke-dasharray"].includes(name)) return /^[\s,.+\-\deE]+$/.test(value);
+  if (name === "stroke" || name === "fill") {
+    return /^(?:#[\da-f]{3,8}|[a-z]+|rgba?\([\d.,% /\s]+\))$/i.test(value);
+  }
+  if (svgNumbers.has(name)) {
+    return /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?(?:px|%|em)?$/i.test(value)
+      && Math.abs(parseFloat(value)) <= 100000;
+  }
+  if (name === "stroke-linejoin") return /^(?:miter|round|bevel)$/.test(value);
+  if (name === "stroke-linecap") return /^(?:butt|round|square)$/.test(value);
+  if (name === "text-anchor") return /^(?:start|middle|end)$/.test(value);
+  if (name === "transform") {
+    return /^(?:\s*(?:matrix|translate|scale|rotate|skewX|skewY)\s*\([\d\s.,+\-eE]+\)(?:\s*,)?)+\s*$/.test(value);
+  }
+  return false;
+}
+
+function renderDiagram(raw) {
+  let source = raw.replace(/\\(?=(?:<|&lt;)\/?[a-z])/gi, "");
+  if (source.startsWith("&lt;")) {
+    source = source.replace(/&lt;|&gt;|&quot;/g, (entity) => ({"&lt;": "<", "&gt;": ">", "&quot;": '"'})[entity]);
+  }
+  if (source.includes("<!")) return null;
+  const root = new DOMParser().parseFromString(source, "image/svg+xml").documentElement;
+  if (root.localName !== "svg") return null;
+
+  let shapes = 0;
+  let count = 0;
+  const copy = (node, depth) => {
+    const tag = node.localName;
+    if (depth > 25 || ++count > 1000 || (node.namespaceURI && node.namespaceURI !== svgNamespace)) return null;
+    if (!svgShapes.has(tag) && !svgContainers.has(tag) && !svgText.has(tag)) return null;
+    const safe = document.createElementNS(svgNamespace, tag);
+    for (const attribute of node.attributes) {
+      const name = svgAliases.get(attribute.name.toLowerCase()) || attribute.name.toLowerCase();
+      const value = attribute.value.trim();
+      if (validSvgAttribute(name, value)) safe.setAttribute(name, value);
+    }
+    if (svgShapes.has(tag)) shapes += 1;
+    for (const child of node.childNodes) {
+      if (child.nodeType === Node.ELEMENT_NODE) {
+        const clean = copy(child, depth + 1);
+        if (clean) safe.append(clean);
+      } else if (child.nodeType === Node.TEXT_NODE && svgText.has(tag)) {
+        safe.append(child.nodeValue);
+      }
+    }
+    return safe;
+  };
+  const svg = copy(root, 0);
+  if (!svg || !shapes) return null;
+  svg.classList.add("output-svg");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", svg.querySelector("title")?.textContent.trim() || "Diagramma");
+  return svg;
+}
+
+function readBodyDirective(text, opener) {
+  const source = text.slice(opener, opener + 65536);
+  const end = literalEnd(source, 0, "{", "}");
+  if (end < 0) return null;
+  const raw = source.slice(0, end);
+  const statement = raw.slice("{@body".length, -1).trim();
+  const definition = /^const\s+questions\s*=\s*(\[[\s\S]*\])\s*;?$/.exec(statement);
+  const block = {raw, next: opener + end};
+  if (!definition) {
+    const state = /^const\s*\[\s*(?:answers\s*,\s*setAnswers|revealed\s*,\s*setRevealed)\s*\]\s*=\s*DIL\.useState\(\s*(?:\{\s*\}|false)\s*\)\s*;?$/.test(statement);
+    return state ? {...block, quizHint: true} : block;
+  }
+
+  // Riconosce le chiavi del formato esportato senza alterare il contenuto delle stringhe.
+  const json = definition[1].replace(
+    /"(?:[^"\\]|\\.)*"|([,{]\s*)(q|a|c|why)(?=\s*:)|,(?=\s*[}\]])/gs,
+    (value, prefix, key) => key ? prefix + '"' + key + '"' : value === "," ? "" : value,
+  );
+  try {
+    const items = JSON.parse(json);
+    const valid = (item) => item && typeof item.q === "string" && item.q.trim()
+      && Array.isArray(item.a) && item.a.length >= 2 && item.a.length <= 12
+      && item.a.every((answer) => typeof answer === "string")
+      && Number.isInteger(item.c) && item.c >= 0 && item.c < item.a.length
+      && (item.why === undefined || typeof item.why === "string");
+    if (items.length && items.length <= 100 && items.every(valid)) {
+      return {...block, quiz: items.map(({q, a, c, why}) => ({q, a, c, why}))};
+    }
+  } catch {
+    // Le direttive fuori dal formato supportato si conservano come codice.
+  }
+  return block;
+}
+
+function readQuizCondition(text, opener) {
+  const source = text.slice(opener, opener + 65536);
+  if (!/^\{#if\s+(?:revealed|answers\[\s*i\s*\]\s*===\s*item\.c)\s*\}/.test(source)) return null;
+  let depth = 0;
+  for (const match of source.matchAll(/\{#if(?=\s)|\{\/if\s*\}/g)) {
+    if (match[0] === "{#if") depth += 1;
+    else if (--depth === 0) {
+      const end = match.index + match[0].length;
+      return {raw: source.slice(0, end), next: opener + end, quizHint: true};
+    }
+  }
+  return null;
+}
+
+function isQuizScore(text) {
+  return /^\{questions\.filter\(\((\w+),(\w+)\)=>answers\[\2\]===\1\.c\)\.length\}\/\{questions\.length\}$/.test(text.replace(/\s+/g, ""));
+}
+
+function readComponent(text, match, start) {
+  const token = match.groups;
+  const opener = match.index;
+  if (token.each) {
+    const block = readEach(text, opener, start);
+    if (!block) return null;
+    return block.quizHint ? block : {each: block, next: block.next};
+  }
+  if (token.body) {
+    const block = readBodyDirective(text, opener);
+    if (!block) return null;
+    return block.quiz || block.quizHint ? block : {...block, widgetCode: true};
+  }
+  if (token.condition) return readQuizCondition(text, opener);
+  const tag = token.tag?.toLowerCase();
+  if (token.closing || (tag !== "svg" && tag !== "title")) return null;
+  const content = readTagBody(text, start, tag);
+  if (!content) return null;
+  if (tag === "svg") return {svg: text.slice(opener, content.next), next: content.next};
+  const attributes = blockAttributes(token.attributes);
+  return {
+    title: {text: content.text, size: attributes.get("size"), tabular: /\btabularNums\b/i.test(token.attributes)},
+    next: content.next,
+  };
 }
 
 function readFormula(text, index, opener) {
@@ -1717,13 +1913,6 @@ function* markupTokens(text, formulas) {
       const end = text.indexOf(token.code, scan.lastIndex);
       const lineEnd = text.indexOf("\n", scan.lastIndex);
       if (end >= 0 && (lineEnd < 0 || end < lineEnd)) scan.lastIndex = end + token.code.length;
-    } else if (token.each) {
-      const block = readEach(text, match.index, scan.lastIndex);
-      if (!block) continue;
-      if (offset < match.index) yield text.slice(offset, match.index);
-      yield {each: block};
-      scan.lastIndex = block.next;
-      offset = block.next;
     } else if (token.math) {
       const formula = readFormula(text, scan.lastIndex, token.math);
       if (!formula) continue;
@@ -1732,6 +1921,15 @@ function* markupTokens(text, formulas) {
       scan.lastIndex = formula.next;
       offset = formula.next;
     } else {
+      const component = readComponent(text, match, scan.lastIndex);
+      if (component) {
+        if (offset < match.index) yield text.slice(offset, match.index);
+        yield component;
+        scan.lastIndex = component.next;
+        offset = component.next;
+        continue;
+      }
+      if (!token.tag) continue;
       const tag = token.tag.toLowerCase();
       const custom = tag.includes("-") || tag.includes("_") || document.createElement(tag) instanceof HTMLUnknownElement;
       if (!styledTags.has(tag) && (!custom || foreignTags.has(tag))) continue;
@@ -1744,11 +1942,32 @@ function* markupTokens(text, formulas) {
 }
 
 function styledParts(parts, view) {
+  const tokens = [];
+  let run = [];
+  const flush = () => {
+    for (const token of markupTokens(run.join("\n"), view.formulas)) tokens.push(token);
+    run = [];
+  };
+  for (const part of parts) {
+    if (typeof part === "string") run.push(part);
+    else {
+      flush();
+      tokens.push(part);
+    }
+  }
+  flush();
+  const hasQuiz = tokens.some((token) => token.quiz);
   const root = {children: []};
   const stack = [root];
   const append = (token) => {
     const parent = stack.at(-1);
-    if (typeof token === "string" || !token.tag) {
+    if (token.quizHint) {
+      if (!hasQuiz) parent.children.push({...token, widgetCode: true});
+    } else if (token.title) {
+      if (!hasQuiz || !isQuizScore(token.title.text)) {
+        parent.children.push("\uFDD2" + (view.titles.push(token.title) - 1) + "\uFDD3");
+      }
+    } else if (typeof token === "string" || !token.tag) {
       parent.children.push(token);
     } else if (token.closing) {
       const open = stack.findLastIndex((node) => node.tag === token.tag);
@@ -1768,20 +1987,7 @@ function styledParts(parts, view) {
     }
   };
 
-  let run = [];
-  const flush = () => {
-    for (const token of markupTokens(run.join("\n"), view.formulas)) append(token);
-    run = [];
-  };
-  for (const part of parts) {
-    if (typeof part === "string") {
-      run.push(part);
-    } else {
-      flush();
-      append(part);
-    }
-  }
-  flush();
+  for (const token of tokens) append(token);
   const normalize = (children) => {
     const result = [];
     const push = (part) => {
@@ -1871,6 +2077,12 @@ function renderStyled(container, parts, view) {
       mappedAttachment(container, part.ref, view);
     } else if (part.each) {
       renderEach(container, part.each, view);
+    } else if (part.svg) {
+      container.append(renderDiagram(part.svg) || literalBlock(part.svg));
+    } else if (part.quiz) {
+      container.append(renderQuiz(part.quiz));
+    } else if (part.widgetCode) {
+      container.append(literalBlock(part.raw));
     } else if (part.tag === "writingblock") {
       writingBlock(container, part, view);
     } else {
@@ -1881,11 +2093,65 @@ function renderStyled(container, parts, view) {
   }
 }
 
+function literalBlock(source) {
+  const pre = make("pre");
+  pre.append(make("code", source));
+  return pre;
+}
+
+function renderQuiz(questions) {
+  const form = make("form", undefined, "archive-quiz");
+  form.append(make("h3", "Quiz"));
+  const fields = questions.map((question, index) => {
+    const field = make("fieldset", undefined, "quiz-question");
+    field.append(make("legend", (index + 1) + ". " + question.q));
+    const choices = question.a.map((answer) => {
+      const radio = make("input");
+      radio.type = "radio";
+      radio.name = "risposta-" + index;
+      const label = make("label", undefined, "quiz-option");
+      label.append(radio, make("span", answer));
+      field.append(label);
+      return radio;
+    });
+    const feedback = make("div", undefined, "quiz-feedback");
+    feedback.hidden = true;
+    field.append(feedback);
+    form.append(field);
+    return {choices, feedback};
+  });
+  const button = make("button", "Verifica risposte", "quiz-check");
+  button.type = "submit";
+  const score = make("p", undefined, "quiz-score");
+  score.setAttribute("role", "status");
+  score.hidden = true;
+  form.append(button, score);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    let correct = 0;
+    for (const [index, question] of questions.entries()) {
+      const {choices, feedback} = fields[index];
+      const matched = choices[question.c].checked;
+      if (matched) correct += 1;
+      feedback.replaceChildren(
+        make("p", matched ? "Corretto" : "Risposta corretta: " + question.a[question.c]),
+      );
+      if (question.why) feedback.append(make("p", question.why));
+      feedback.hidden = false;
+    }
+    score.hidden = false;
+    score.textContent = "Risposte corrette: " + correct + " / " + questions.length;
+  });
+  form.addEventListener("change", () => {
+    score.hidden = true;
+    for (const {feedback} of fields) feedback.hidden = true;
+  });
+  return form;
+}
+
 function renderEach(container, block, view) {
   if (!block.rows) {
-    const pre = make("pre");
-    pre.append(make("code", block.raw));
-    container.append(pre);
+    container.append(literalBlock(block.raw));
     return;
   }
   if (!block.rows.length) return;
@@ -1908,7 +2174,7 @@ function renderMessage(container, message, files, refs) {
   const view = {
     files, refs, shown: new Set(), usedBlocks: new Set(),
     blocks: new Map(message.blocks.map((block) => [block.id, block])),
-    formulas: [],
+    formulas: [], titles: [],
     sources: new Map((message.sources || []).map(({marker, links}) => [marker, links])),
   };
   renderStyled(container, styledParts(message.parts, view), view);
